@@ -1,0 +1,56 @@
+{
+  "name": "server",
+  "version": "1.0.0",
+  "description": "",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.js",
+    "build": "tsc -p tsconfig.json",
+    "start": "node --enable-source-maps dist/server.js",
+    "typecheck": "tsc --noEmit",
+    "browser:install": "playwright-core install chromium --only-shell",
+    "usage:report": "node scripts/usage-report.mjs",
+    "payments:reconcile": "node --import tsx scripts/reconcile-payments.mjs",
+    "worker:ocr": "node --import tsx worker/ocr.js",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "keywords": [],
+  "author": "rensdev",
+  "type": "module",
+  "dependencies": {
+    "@ai-sdk/openai": "^4.0.86",
+    "@aws-sdk/client-s3": "^3.1149.0",
+    "@aws-sdk/s3-request-presigner": "^3.1149.0",
+    "@babel/parser": "^8.0.7",
+    "@supabase/supabase-js": "^2.117.3",
+    "ai": "^7.0.130",
+    "bcrypt": "^6.0.0",
+    "cheerio": "^1.2.0",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.5",
+    "express": "4",
+    "jsonwebtoken": "^9.0.3",
+    "midtrans-client": "^1.4.3",
+    "mongoose": "^9.10.4",
+    "p-map": "^7.0.8",
+    "postcss": "^8.5.29",
+    "tailwindcss": "^3.4.19",
+    "undici": "^8.11.2",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@fortawesome/fontawesome-free": "^6.4.0",
+    "@types/bcrypt": "^6.0.0",
+    "@types/cookie-parser": "^1.4.10",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^4.17.25",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "optionalDependencies": {
+    "playwright-core": "^1.64.0"
+  }
+}
