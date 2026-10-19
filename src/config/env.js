@@ -11,7 +11,7 @@ const MIN_SECRET_LENGTH = 32;
 // What the code used to fall back to. Anyone who has read the source knows it.
 const REJECTED_SECRETS = new Set(["fallback_secret"]);
 // Vite's default dev server. Only used outside production when ORIGINS is unset.
-const DEV_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"];
+const DEV_ORIGINS = ["https://ai.rensdev.my.id"];
 
 const isProduction = () => process.env.NODE_ENV === "production";
 

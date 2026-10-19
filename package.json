@@ -8,11 +8,16 @@
     "build": "tsc -p tsconfig.json",
     "start": "node --enable-source-maps dist/server.js",
     "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
     "browser:install": "playwright-core install chromium --only-shell",
     "usage:report": "node scripts/usage-report.mjs",
     "payments:reconcile": "node --import tsx scripts/reconcile-payments.mjs",
     "worker:ocr": "node --import tsx worker/ocr.js",
-    "test": "node --import tsx --test test/*.test.ts"
+    "deploy": "bash deploy.sh",
+    "sync-deps": "cp -r node_modules /home/rendy/renscraft-server/",
+    "sync-env": "cp .env /home/rendy/renscraft-server/.env",
+    "restart-prod": "pm2 restart renscraft-api",
+    "sync-all": "bun run sync-deps && bun run sync-env && bun run restart-prod"
   },
   "keywords": [],
   "author": "rensdev",

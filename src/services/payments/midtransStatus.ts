@@ -194,6 +194,13 @@ export const ALLOWED_FROM: Readonly<
   canceled: ["pending", "challenge"],
   refunded: ["paid"],
   chargeback: ["paid"],
+
+  // Status khusus untuk manual transfer (nggak lewat Midtrans)
+  pending_manual: [],
+  ocr_pending: [],
+  waiting_approval: [],
+  manual_review: [],
+  manual_rejected: [],
 };
 
 export const canTransition = (
