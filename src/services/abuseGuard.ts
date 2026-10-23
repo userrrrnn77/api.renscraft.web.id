@@ -95,6 +95,7 @@ export type SignupGrant = {
 
 // Decide how many free credits this signup gets. The counter is a single atomic
 // upsert + $inc, so parallel signups from one IP cannot all slip under the limit.
+
 export async function evaluateFreeSignup(req: Request): Promise<SignupGrant> {
   const { credits, maxPerIp, windowDays } = signupConfig();
 
@@ -102,6 +103,7 @@ export async function evaluateFreeSignup(req: Request): Promise<SignupGrant> {
   if (!ip) return { credits: 0, ipHash: null, reason: "no_ip" };
 
   const ipHash = hashIp(ip);
+
   const bucket = await IpSignupBucket.findOneAndUpdate(
     { ipHash },
     {

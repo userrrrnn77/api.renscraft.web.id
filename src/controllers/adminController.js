@@ -12,6 +12,8 @@ import {
   approveManualOrder,
   rejectManualOrder,
 } from "../services/payments/manualPayment.js";
+import mongoose from "mongoose";
+import { RedeemCode } from "../models/RedeemCode.js";
 
 // ─── Rate limit in-memory ───────────────────────────────────────────────────
 const loginAttempts = new Map();
@@ -43,13 +45,21 @@ const safeEqual = (a, b) => {
   return timingSafeEqual(ab, bb);
 };
 
-const cookieOptions = () => ({
-  httpOnly: true,
-  secure: process.env.NODE_ENV === "production",
-  sameSite: "lax",
-  maxAge: 12 * 60 * 60 * 1000, // 12 jam, sinkron sama ADMIN_TTL di jwt.js
-  path: "/api/admin",
-});
+const cookieOptions = () => {
+  const isProd = process.env.NODE_ENV === "production";
+
+  return {
+    httpOnly: true,
+    // Secure cuma di prod (HTTPS). Di dev, cookie harus bisa dikirim via HTTP localhost.
+    secure: isProd,
+    // SameSite=None WAJIB bareng Secure. Kalau dev, pakai "lax" biar cookie tetap jalan.
+    sameSite: isProd ? "none" : "lax",
+    // Ini yang tadi kelewat: Domain supaya cookie bisa dibaca dari api.rensdev.my.id juga.
+    domain: isProd ? ".rensdev.my.id" : undefined,
+    maxAge: 12 * 60 * 60 * 1000,
+    path: "/api/admin",
+  };
+};
 
 // ─── Auth ───────────────────────────────────────────────────────────────────
 
@@ -399,4 +409,107 @@ export const adminRejectManual = asyncHandler(async (req, res) => {
 
   console.log(`[Admin] Manual rejected ${orderId} by ${label}: ${reason}`);
   res.json({ ok: true, order: result.order });
+});
+
+// ─── Redeem codes ───────────────────────────────────────────────────────────
+const CODE_RE = /^[A-Z0-9_-]{3,64}$/;
+
+export const adminListRedeemCodes = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = paginate(req);
+  const [codes, total] = await Promise.all([
+    RedeemCode.find({}).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+    RedeemCode.countDocuments({}),
+  ]);
+  res.json({ codes, total, page, limit });
+});
+
+export const adminCreateRedeemCode = asyncHandler(async (req, res) => {
+  const code = String(req.body?.code ?? "")
+    .trim()
+    .toUpperCase();
+  const credits = parseInt(req.body?.credits, 10);
+  const maxRedemptions = parseInt(req.body?.maxRedemptions, 10);
+  const expiresAtRaw = req.body?.expiresAt;
+  const expiresAt = new Date(expiresAtRaw);
+
+  if (!CODE_RE.test(code)) {
+    return fail(
+      res,
+      400,
+      "ADMIN_REDEEM_CODE_INVALID",
+      {},
+      "Code must be 3-64 chars: A-Z, 0-9, _ or -",
+    );
+  }
+  if (!Number.isInteger(credits) || credits < 1 || credits > 10000) {
+    return fail(
+      res,
+      400,
+      "ADMIN_REDEEM_CREDITS_INVALID",
+      {},
+      "Credits must be 1-10000",
+    );
+  }
+  if (
+    !Number.isInteger(maxRedemptions) ||
+    maxRedemptions < 1 ||
+    maxRedemptions > 10000
+  ) {
+    return fail(
+      res,
+      400,
+      "ADMIN_REDEEM_MAX_INVALID",
+      {},
+      "maxRedemptions must be 1-10000",
+    );
+  }
+  if (isNaN(expiresAt.getTime()) || expiresAt <= new Date()) {
+    return fail(
+      res,
+      400,
+      "ADMIN_REDEEM_EXPIRY_INVALID",
+      {},
+      "Expiry must be a future date",
+    );
+  }
+
+  try {
+    const redeem = await RedeemCode.create({
+      code,
+      credits,
+      maxRedemptions,
+      expiresAt,
+      createdBy: String(req.body?.label ?? "admin").slice(0, 60),
+    });
+    console.log(
+      `[Admin] Created redeem code ${code} (${credits} credits, max ${maxRedemptions})`,
+    );
+    res.status(201).json({ redeem });
+  } catch (err) {
+    if (err?.code === 11000) {
+      return fail(
+        res,
+        409,
+        "ADMIN_REDEEM_CODE_EXISTS",
+        {},
+        "A code with that name already exists",
+      );
+    }
+    throw err;
+  }
+});
+
+export const adminDeleteRedeemCode = asyncHandler(async (req, res) => {
+  const id = String(req.params.id || "");
+  if (!mongoose.isObjectIdOrHexString(id)) {
+    return fail(res, 400, "ADMIN_REDEEM_ID_INVALID", {}, "Invalid id");
+  }
+  const result = await RedeemCode.findByIdAndDelete(id);
+  if (!result) {
+    return fail(res, 404, "ADMIN_REDEEM_NOT_FOUND", {}, "Code not found");
+  }
+  console.log(
+    `[Admin] Deleted redeem code ${result.code} (${result.redemptionCount}/${result.maxRedemptions} used)`,
+  );
+  res.json({ ok: true });
 });

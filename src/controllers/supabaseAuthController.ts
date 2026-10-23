@@ -3,7 +3,16 @@
 import type { Request, Response } from "express";
 import { createClient } from "@supabase/supabase-js";
 import { User, type AuthProvider } from "../models/User.js";
-import { evaluateFreeSignup } from "../services/abuseGuard.js";
+import {
+  evaluateFreeSignup,
+  getClientIp,
+  hashIp,
+} from "../services/abuseGuard.js";
+import {
+  ensureReferralForUser,
+  normalizeReferralCode,
+  processReferralRewards,
+} from "../services/referral.js";
 import { setSessionCookie } from "./authController.js";
 import { fail } from "../utils/apiError.js";
 
@@ -122,8 +131,15 @@ export async function createSupabaseSession(req: Request, res: Response) {
   }
 
   let user = await User.findOne({ supabaseId: supabaseUser.id });
+  let isNewUser = false;
+
+  // Siapin data IP dan Referral dari request
+  const ip = getClientIp(req);
+  const signupIpHash = ip ? hashIp(ip) : null;
+  const referralCode = normalizeReferralCode(req.body?.referralCode);
 
   if (!user) {
+    // Cek apakah email ini udah dipake akun local
     const emailOwner = await User.findOne({ email }).select("_id provider");
     if (emailOwner) {
       res.status(409).json({
@@ -134,6 +150,7 @@ export async function createSupabaseSession(req: Request, res: Response) {
       return;
     }
 
+    // Hitung kredit free signup (biasanya 15)
     const grant = await evaluateFreeSignup(req);
 
     try {
@@ -145,6 +162,7 @@ export async function createSupabaseSession(req: Request, res: Response) {
         credits: grant.credits,
         ...(grant.ipHash ? { signupIpHash: grant.ipHash } : {}),
       });
+      isNewUser = true;
     } catch (err: unknown) {
       const code =
         typeof err === "object" && err !== null && "code" in err
@@ -166,6 +184,7 @@ export async function createSupabaseSession(req: Request, res: Response) {
       }
     }
   } else {
+    // Kalo user udah ada, cuma update profile
     user.name = displayName(supabaseUser);
     user.provider = provider;
     if (user.email !== email) {
@@ -176,6 +195,42 @@ export async function createSupabaseSession(req: Request, res: Response) {
     }
     await user.save();
   }
+
+  // ─── PROSES REFERRAL (KHUSUS USER BARU) ──────────────────────────────────
+  let referralApplied = false;
+  let creditsSource = "none";
+  let finalCredits = user.credits ?? 0;
+
+  if (isNewUser) {
+    creditsSource = finalCredits > 0 ? "free_signup" : "none";
+
+    if (referralCode) {
+      const result = await processReferralRewards(
+        user._id,
+        referralCode,
+        signupIpHash,
+        finalCredits,
+      );
+
+      if (result.applied) {
+        referralApplied = true;
+        creditsSource = "referral";
+        // Tambahin kredit referral (10) ke variabel lokal buat response
+        finalCredits = finalCredits + result.credits;
+      }
+    }
+
+    // Bikin kode referral buat dia (buat dibagi-bagi)
+    try {
+      await ensureReferralForUser(user._id, signupIpHash);
+    } catch (err) {
+      console.error(
+        "[Referral] failed to create code for new OAuth user:",
+        err,
+      );
+    }
+  }
+  // ────────────────────────────────────────────────────────────────────────
 
   setSessionCookie(res, {
     userId: user._id.toString(),
@@ -188,7 +243,10 @@ export async function createSupabaseSession(req: Request, res: Response) {
       name: user.name,
       email: user.email,
       provider: user.provider,
-      credits: user.credits ?? 0,
+      credits: finalCredits, // Dapet 15 (atau 25 kalo pake referral)
     },
+    referralApplied,
+    creditsAwarded: finalCredits,
+    creditsSource,
   });
 }

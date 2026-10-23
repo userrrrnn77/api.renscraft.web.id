@@ -23,6 +23,7 @@ import {
   categorySlots,
   EXTRA_KEY_RE,
 } from "./slotCatalog.js";
+import { guessCategory } from "./categoryGuess.js";
 
 const SlotKindSchema = z.enum([
   "text",
@@ -63,7 +64,7 @@ const ComposerSchema = z.object({
 function buildVocabulary() {
   const lines = [];
   for (const cat of CATEGORIES) {
-    if (!cat.slots.length) continue;
+    if (!cat.slots?.length) continue;
     const items = cat.slots.map((k) => {
       const s = SLOTS[k];
       return `\`${k}\` (${s.label}, ${s.kind})`;
@@ -116,10 +117,57 @@ Prompt: "undangan pernikahan Rina & Dimas"
 
 ## ATURAN KERAS
 
-1. **3-8 slot total**. Jangan lebih. Kualitas > kuantitas.
+1. **Maksimal 6 slot total** (termasuk brand_name & vibe). Idealnya 4-5.
 2. **brand_name SELALU** jadi slot pertama. Label menyesuaikan konteks: "Nama warkop", "Nama lengkap", "Nama kedua mempelai".
 3. **vibe SELALU** jadi slot terakhir. kind: "choice", group: "style", options: ${JSON.stringify(VIBE_OPTIONS)}.
-4. **Slot fakta: pilih yang paling berdampak**, bukan semua yang mungkin. Kalau 4 sudah cukup, jangan tambah 5.
+4. **Maksimal 4 slot fakta tambahan** (selain brand_name). Kalau 2-3 cukup, jangan tambah 4.
+
+### MUST-HAVE vs NICE-TO-HAVE — WAJIB DIBEDAKAN
+
+**Must-have** = TANPA data ini website GAK BERFUNGSI atau kelihatan BOHONG:
+- brand_name (SELALU)
+- Kontak utama (whatsapp / email / rsvp) — kalau ada CTA
+- Menu / produk / layanan — kalau itu katalog
+- Alamat / lokasi — kalau bisnis fisik
+- Jam buka — kalau bisnis fisik
+- Tanggal / acara — kalau event
+
+**Nice-to-have** = bikin website lebih kaya TAPI AI bisa generate copywriting sendiri:
+- Cerita unik / profil panjang / about singkat
+- Pengalaman klien / testimoni
+- Bio panjang (kecuali portfolio yang butuh)
+- Tagline (selalu copywriting AI)
+- Best seller (bisa ditebak dari urutan menu)
+- Promo (opsional)
+- Cara order (bisa ditulis AI dari konteks)
+- Area kirim / area layanan (kalau gak disebut, AI bisa generate placeholder netral)
+
+**ATURAN MUST-HAVE:**
+- **HANYA masukkan must-have ke slots[]. Nice-to-have JANGAN dijadikan pertanyaan.**
+- **Kalau user SUDAH nyebut must-have di prompt**, TETAP masukkan sebagai slot (biar nilainya ke-extract lewat 'extracted'), tapi **JANGAN tambahin must-have lain yang GAK disebut** cuma karena "biasanya perlu".
+- Kalau ragu, ANGGAP NICE-TO-HAVE dan jangan masukkan.
+
+**Contoh konkret:**
+Prompt: "warung sembako putra 58, jual beras gula minyak, buka 8-5, wa 08123456789, di jl merdeka bandung"
+→ Semua must-have udah disebut. Nice-to-have (cara_order, area_kirim, instagram) JANGAN dijadikan slot.
+→ Output:
+  - brand_name (extracted: "Putra 58")
+  - produk (extracted: "beras\ngula\nminyak")
+  - jam_buka (extracted: "8-5")
+  - whatsapp (extracted: "08123456789")
+  - address (extracted: "Jl. Merdeka, Bandung")
+  - vibe
+→ questionKeys KOSONG. Jangan tambah x_cara_order, x_area_kirim, atau instagram.
+
+Prompt: "toko kue, jual brownies dan cookies"
+→ Must-have: produk (ada). Nice-to-have: harga, cara_order, area_kirim, promo — JANGAN jadi slot.
+→ Output:
+  - brand_name (extracted: "Toko Kue")
+  - produk (extracted: "brownies\ncookies")
+  - whatsapp
+  - vibe
+→ Sisa pertanyaan: whatsapp (kalau gak disebut) + vibe. Harga & cara_order di-generate AI.
+
 5. **Kalau vocabulary punya key yang cocok, pakai key itu** (mis. menu, jam_buka, address, whatsapp, email). Biar placeholder & validasi katalog berlaku.
 6. **Kalau butuh sesuatu yang tidak ada di vocabulary, bikin key x_**: lowercase, huruf/angka/underscore, 3-30 char, diawali x_. Set origin-nya implicit "ai".
 7. **Label**: 2-5 kata, singkat. Contoh bagus: "Menu & harga", "Klien yang pernah kerja bareng". Contoh jelek: "Daftar item menu makanan beserta harga masing-masing".
@@ -158,7 +206,10 @@ ${buildVocabulary()}
     { "key": "x_sesuatu", "label": "...", "question": "...", "kind": "list", "group": "fact", "placeholder": "..." },
     { "key": "vibe", "label": "Gaya tampilan", "question": "Mau nuansanya gimana?", "kind": "choice", "group": "style", "options": ${JSON.stringify(VIBE_OPTIONS)} }
   ]
-}`;
+}
+- "warung sembako", "toko kelontong", "toko bahan pokok" → toko_produk
+  (BUKAN kuliner, karena jual barang bukan makanan siap saji)  
+`;
 }
 
 // ── Evidence check (sama seperti sebelumnya) ────────────────────────────────
@@ -171,7 +222,15 @@ const normText = (s) =>
     .trim();
 
 const stripUrl = (s) =>
-  normText(s).replace(/^https?:\/\/(www\.)?/, "").replace(/\/+$/, "");
+  normText(s)
+    .replace(/^https?:\/\/(www\.)?/, "")
+    .replace(/\/+$/, "");
+
+const loose = (s) =>
+  normText(s)
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 
 function hasEvidence(slotDef, value, prompt) {
   const p = normText(prompt);
@@ -185,15 +244,21 @@ function hasEvidence(slotDef, value, prompt) {
       return (slotDef.options ?? []).includes(value);
     case "list":
     case "longtext": {
-      const lines = value.split("\n").map(normText).filter(Boolean);
-      return lines.length > 0 && lines.every((l) => p.includes(l));
+      const pl = loose(prompt);
+      const lines = value.split("\n").map(loose).filter(Boolean);
+      return lines.length > 0 && lines.every((l) => pl.includes(l));
     }
     case "url": {
       const v = stripUrl(value);
       return v.length > 0 && stripUrl(prompt).includes(v);
     }
-    default:
-      return p.includes(normText(value));
+    default: {
+      const v = loose(value);
+      const pl = loose(prompt);
+      if (v && pl.includes(v)) return true;
+      const vNoSpace = v.replace(/\s+/g, "");
+      return vNoSpace.length >= 3 && pl.replace(/\s+/g, "").includes(vNoSpace);
+    }
   }
 }
 
@@ -219,10 +284,15 @@ function cleanSlots(rawSlots, extracted, prompt) {
 
     const kind = s.kind;
     const group = s.group === "style" ? "style" : "fact";
-    const placeholder = String(s.placeholder ?? "").trim().slice(0, 120);
+    const placeholder = String(s.placeholder ?? "")
+      .trim()
+      .slice(0, 120);
     const options =
       kind === "choice" && Array.isArray(s.options) && s.options.length > 0
-        ? s.options.map((o) => String(o).trim()).filter(Boolean).slice(0, 10)
+        ? s.options
+            .map((o) => String(o).trim())
+            .filter(Boolean)
+            .slice(0, 10)
         : kind === "choice"
           ? VIBE_OPTIONS // fallback kalau composer lupa
           : [];
@@ -237,7 +307,8 @@ function cleanSlots(rawSlots, extracted, prompt) {
       placeholder,
       options: [...options],
       origin: isCatalog ? "catalog" : "ai",
-      mapsTo: typeof s.mapsTo === "string" && s.mapsTo.length > 0 ? s.mapsTo : null,
+      mapsTo:
+        typeof s.mapsTo === "string" && s.mapsTo.length > 0 ? s.mapsTo : null,
     });
   }
 
@@ -300,12 +371,19 @@ export async function classifyPrompt(prompt) {
     abortSignal: AbortSignal.timeout(cfg.classifyTimeoutMs),
   });
 
-  // Confidence rendah → "lainnya" + slots generic (brand_name + vibe).
   let category = object.category;
   let rawSlots = object.slots;
   let extracted = object.extracted;
 
-  if (object.confidence < cfg.minConfidence) {
+  // Kata kunci di prompt = bukti kedua, dipakai sebagai penengah.
+  const guess = guessCategory(prompt);
+  const unsure = object.confidence < cfg.minConfidence && guess !== category;
+  console.log(
+    `[Brief] classify raw: model=${object.category} conf=${object.confidence} keyword=${guess ?? "-"} unsure=${unsure}`,
+  );
+
+  if (unsure) {
+    // Model ragu & kata kunci tidak sejalan → "lainnya" + slots generic.
     category = "lainnya";
     rawSlots = [
       {
@@ -329,6 +407,16 @@ export async function classifyPrompt(prompt) {
         mapsTo: "phone",
       },
       {
+        key: "address",
+        label: "Alamat",
+        question: "Alamat lengkapnya di mana?",
+        kind: "longtext",
+        group: "fact",
+        placeholder: "Alamat belum diisi",
+        options: [],
+        mapsTo: "address",
+      },
+      {
         key: "vibe",
         label: "Gaya tampilan",
         question: "Mau nuansanya gimana?",
@@ -338,7 +426,9 @@ export async function classifyPrompt(prompt) {
         mapsTo: null,
       },
     ];
-    extracted = {};
+  } else if (category === "lainnya" && guess) {
+    // Model bilang "lainnya" padahal kata kuncinya jelas → pakai tebakan.
+    category = guess;
   }
 
   const slots = cleanSlots(rawSlots, extracted, prompt);

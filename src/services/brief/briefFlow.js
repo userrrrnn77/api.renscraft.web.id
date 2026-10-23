@@ -31,6 +31,7 @@ export function pickQuestions(brief) {
     ? open.find((d) => d.key === "vibe" || d.group === "style")
     : null;
   const facts = open.filter((d) => d !== styleSlot);
+  if (facts.length === 0) return [];
 
   const keys = facts
     .slice(0, styleSlot ? MAX_QUESTIONS - 1 : MAX_QUESTIONS)
@@ -39,7 +40,8 @@ export function pickQuestions(brief) {
   return keys;
 }
 
-const categoryList = () => CATEGORIES.map((c) => ({ id: c.id, label: c.label }));
+const categoryList = () =>
+  CATEGORIES.map((c) => ({ id: c.id, label: c.label }));
 
 export function buildState(brief) {
   const cat = getCategory(brief.category);
@@ -67,8 +69,9 @@ export function buildState(brief) {
 
   return {
     briefId: String(brief._id),
+    status: brief.status,
     mode: questionKeys.length > 0 ? "wizard" : "ready",
-    autoStart: defs.length === 0,
+    autoStart: questionKeys.length === 0,
     category: { id: cat.id, label: cat.label },
     sampleData: cat.sampleData === true,
     slots,

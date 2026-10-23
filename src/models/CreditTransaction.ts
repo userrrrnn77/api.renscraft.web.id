@@ -16,6 +16,7 @@ export const CREDIT_TX_TYPES = [
   "refund",
   "admin_grant",
   "admin_adjust",
+  "redeem",
 ] as const;
 export type CreditTxType = (typeof CREDIT_TX_TYPES)[number];
 

@@ -15,14 +15,23 @@ const SlotDefSchema = new Schema(
     kind: {
       type: String,
       required: true,
-      enum: ["text", "longtext", "list", "choice", "phone", "email", "handle", "url"],
+      enum: [
+        "text",
+        "longtext",
+        "list",
+        "choice",
+        "phone",
+        "email",
+        "handle",
+        "url",
+      ],
     },
     group: { type: String, enum: ["fact", "style"], default: "fact" },
     placeholder: { type: String, default: "" },
     options: { type: [String], default: [] },
     // "catalog" = pakai key standar dari SLOTS (placeholder & validasi katalog
     // berlaku). "ai" = key x_* yang dibuat composer.
-    origin: { type: String, enum: ["catalog", "ai"], default: "ai" },
+    origin: { type: String, enum: ["catalog", "ai", "user"], default: "ai" },
     // Optional: memetakan ke Project.contract.facts key, mis. "openingHours".
     // Dipakai mergeBriefFacts supaya facts tetap terisi walau key custom.
     mapsTo: { type: String, default: null },
@@ -47,7 +56,11 @@ const BriefSchema = new Schema(
     slots: { type: [SlotDefSchema], default: [] },
     answers: { type: Schema.Types.Mixed, default: {} },
     questionKeys: { type: [String], default: [] },
-    status: { type: String, enum: ["open", "used"], default: "open" },
+    status: {
+      type: String,
+      enum: ["classifying", "open", "used"],
+      default: "open",
+    },
   },
   {
     timestamps: true,

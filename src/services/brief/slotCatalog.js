@@ -111,7 +111,8 @@ export const SLOTS = {
   },
   projects: {
     label: "Project",
-    question: "Project yang mau ditampilkan? (satu per baris: Judul | deskripsi | link)",
+    question:
+      "Project yang mau ditampilkan? (satu per baris: Judul | deskripsi | link)",
     kind: "list",
     group: "fact",
     placeholder: "Project akan tampil di sini",
@@ -164,7 +165,8 @@ export const SLOTS = {
   // jasa
   layanan: {
     label: "Layanan & harga",
-    question: "Layanannya apa saja? (satu per baris: Layanan - harga / mulai dari)",
+    question:
+      "Layanannya apa saja? (satu per baris: Layanan - harga / mulai dari)",
     kind: "list",
     group: "fact",
     placeholder: "Layanan akan tampil di sini",
@@ -260,31 +262,61 @@ export const CATEGORIES = [
     id: "kuliner",
     label: "Kuliner",
     hint: "warkop, cafe, restoran, warung, katering, toko kue, bakery",
-    slots: ["brand_name", "menu", "address", "jam_buka", "whatsapp", "best_seller", "instagram", "vibe"],
+    slots: [
+      "brand_name",
+      "menu",
+      "address",
+      "jam_buka",
+      "whatsapp",
+      "best_seller",
+      "instagram",
+      "vibe",
+    ],
   },
   {
     id: "portfolio",
     label: "Portfolio",
     hint: "portfolio / CV online / personal website developer, desainer, fotografer, freelancer",
-    slots: ["brand_name", "profesi", "bio", "projects", "tech_stack", "github", "linkedin", "email", "cv_url", "vibe"],
-  },
-  {
-    id: "toko_produk",
-    label: "Toko / Produk",
-    hint: "toko online, katalog produk, bouquet, fashion, kerajinan, jualan barang",
-    slots: ["brand_name", "produk", "whatsapp", "cara_order", "instagram", "area_kirim", "vibe"],
+    slots: [
+      "brand_name",
+      "profesi",
+      "bio",
+      "projects",
+      "tech_stack",
+      "github",
+      "linkedin",
+      "email",
+      "cv_url",
+      "vibe",
+    ],
   },
   {
     id: "jasa",
     label: "Jasa / Layanan",
     hint: "bengkel, salon, laundry, les privat, fotografi, konsultan, kontraktor, klinik",
-    slots: ["brand_name", "layanan", "whatsapp", "address", "jam_buka", "area_layanan", "vibe"],
+    slots: [
+      "brand_name",
+      "layanan",
+      "whatsapp",
+      "address",
+      "jam_buka",
+      "area_layanan",
+      "vibe",
+    ],
   },
   {
     id: "event",
     label: "Event / Undangan",
     hint: "undangan pernikahan, ulang tahun, seminar, reuni, acara komunitas",
-    slots: ["brand_name", "tanggal", "waktu", "address", "rsvp", "rundown", "vibe"],
+    slots: [
+      "brand_name",
+      "tanggal",
+      "waktu",
+      "address",
+      "rsvp",
+      "rundown",
+      "vibe",
+    ],
   },
   {
     id: "artikel",
@@ -296,7 +328,16 @@ export const CATEGORIES = [
     id: "brosur",
     label: "Brosur online",
     hint: "brosur, company profile satu halaman, flyer digital, katalog singkat",
-    slots: ["brand_name", "profil_singkat", "penawaran", "whatsapp", "address", "jam_buka", "promo", "vibe"],
+    slots: [
+      "brand_name",
+      "profil_singkat",
+      "penawaran",
+      "whatsapp",
+      "address",
+      "jam_buka",
+      "promo",
+      "vibe",
+    ],
   },
   {
     // game, kalkulator, todo, timer: tidak butuh data dari user
@@ -314,6 +355,20 @@ export const CATEGORIES = [
     sampleData: true,
   },
   {
+    id: "toko_produk",
+    label: "Toko / Produk",
+    hint: "toko online, katalog produk, warung sembako, toko kelontong, toko bahan pokok, bouquet, fashion, kerajinan, jualan barang",
+    slots: [
+      "brand_name",
+      "produk",
+      "whatsapp",
+      "cara_order",
+      "instagram",
+      "area_kirim",
+      "vibe",
+    ],
+  },
+  {
     id: "lainnya",
     label: "Lainnya",
     hint: "semua yang tidak cocok dengan kategori lain",
@@ -322,6 +377,14 @@ export const CATEGORIES = [
 ];
 
 export const CATEGORY_IDS = new Set(CATEGORIES.map((c) => c.id));
+for (const [i, c] of CATEGORIES.entries()) {
+  if (!Array.isArray(c.slots)) {
+    throw new Error(`[slotCatalog] kategori "${c.id}" tidak punya slots[]`);
+  }
+  if (CATEGORIES.findIndex((x) => x.id === c.id) !== i) {
+    throw new Error(`[slotCatalog] id kategori dobel: "${c.id}"`);
+  }
+}
 
 export const getCategory = (id) =>
   CATEGORIES.find((c) => c.id === id) ?? CATEGORIES[CATEGORIES.length - 1];

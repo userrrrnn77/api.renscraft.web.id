@@ -1,5 +1,12 @@
+process.on("unhandledRejection", (err) => {
+  console.error("[unhandledRejection]", err);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException]", err);
+  process.exit(1);
+});
+
 // src/server.js
-// ... (import sama seperti aslinya)
 import express from "express";
 import "dotenv/config";
 import cors from "cors";
@@ -7,6 +14,7 @@ import cookieParser from "cookie-parser";
 import { connectToDatabase } from "./config/db.js";
 import { getAllowedOrigins, validateEnv } from "./config/env.js";
 import appRouter from "./routes/index.routes.js";
+import { initWebSocket } from "./config/ws.js";
 
 try {
   validateEnv();
@@ -67,8 +75,10 @@ app.use((err, _req, res, _next) => {
   res.status(status).json({ error: message, code });
 });
 
-const port = process.env.PORT || 3000;
+const port = process.env.PORT || 3001;
 
-app.listen(port, () => {
+const httpServer = app.listen(port, () => {
   console.log(`server is running at http://localhost:${port}`);
 });
+
+initWebSocket(httpServer);

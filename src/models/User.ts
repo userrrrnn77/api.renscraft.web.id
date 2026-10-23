@@ -62,7 +62,10 @@ const UserSchema = new Schema<IUser, UserModel, IUserMethods>(
       type: Number,
       default: 0,
       min: 0,
-      validate: { validator: Number.isInteger, message: "credits must be an integer" },
+      validate: {
+        validator: Number.isInteger,
+        message: "credits must be an integer",
+      },
     },
     signupIpHash: { type: String },
   },
@@ -85,6 +88,8 @@ UserSchema.index({ supabaseId: 1 }, { unique: true, sparse: true });
 // Hash password before saving
 UserSchema.pre("save", async function () {
   if (!this.password || !this.isModified("password")) return;
+  // Already a bcrypt hash (registration OTP flow pre-hashes at request-otp time)
+  if (/^\$2[aby]\$\d{2}\$/.test(this.password)) return;
   const salt = await bcrypt.genSalt(10);
   this.password = await bcrypt.hash(this.password, salt);
 });

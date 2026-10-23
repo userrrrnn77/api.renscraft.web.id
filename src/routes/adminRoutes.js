@@ -13,6 +13,9 @@ import {
   adminListManualOrders,
   adminApproveManual,
   adminRejectManual,
+  adminListRedeemCodes,
+  adminCreateRedeemCode,
+  adminDeleteRedeemCode,
 } from "../controllers/adminController.js";
 import { adminMiddleware } from "../middleware/adminMiddleware.js";
 
@@ -33,5 +36,10 @@ adminRouter.post("/users/:id/credits", adminGrantCredits);
 adminRouter.get("/manual", adminListManualOrders);
 adminRouter.post("/manual/:orderId/approve", adminApproveManual);
 adminRouter.post("/manual/:orderId/reject", adminRejectManual);
+
+// Redeem codes
+adminRouter.get("/redeem", adminListRedeemCodes);
+adminRouter.post("/redeem", adminCreateRedeemCode);
+adminRouter.delete("/redeem/:id", adminDeleteRedeemCode);
 
 export default adminRouter;

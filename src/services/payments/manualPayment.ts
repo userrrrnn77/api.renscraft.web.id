@@ -12,6 +12,7 @@ import crypto from "node:crypto";
 import { PaymentOrder } from "../../models/PaymentOrder.js";
 import type { IPaymentOrder } from "../../models/PaymentOrder.js";
 import { finishCredit } from "./paymentService.js";
+import { notifyAdmin } from "../../config/ws.js";
 
 // ── Nominal unik ────────────────────────────────────────────────────────────
 
@@ -213,6 +214,15 @@ export async function attachProof({
     if (!order) {
       const exists = await PaymentOrder.exists({ orderId, owner: ownerId });
       return { ok: false, reason: exists ? "wrong_status" : "not_found" };
+    }
+
+    if (order) {
+      // KIRIM NOTIF KE ADMIN DI SINI
+      notifyAdmin({
+        type: "MANUAL_PAYMENT",
+        title: "Pesanan Manual Baru! 💸",
+        message: `Order ${orderId.slice(-6)}: User udah upload bukti transfer. Cek dashboard!`,
+      });
     }
     return { ok: true, order };
   } catch (err) {
