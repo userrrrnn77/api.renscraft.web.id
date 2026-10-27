@@ -75,7 +75,7 @@ app.use((err, _req, res, _next) => {
   res.status(status).json({ error: message, code });
 });
 
-const port = process.env.PORT || 3001;
+const port = process.env.PORT || 3000;
 
 const httpServer = app.listen(port, () => {
   console.log(`server is running at http://localhost:${port}`);

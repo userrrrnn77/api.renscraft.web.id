@@ -13,9 +13,23 @@ import { CATEGORIES } from "./slotCatalog.js";
 
 // Varian yang tidak ada di hint. Tambah sendiri kalau nemu prompt yang meleset.
 const EXTRA_PHRASES = {
-  portfolio: ["portofolio", "personal website"],
+  portfolio: [
+    "portofolio",
+    "personal website",
+    "fullstack",
+    "developer",
+    "programmer",
+    "freelancer",
+  ],
   kuliner: ["kafe", "resto", "rumah makan", "warung makan"],
-  toko_produk: ["online shop", "olshop", "toko baju"],
+  toko_produk: [
+    "online shop",
+    "olshop",
+    "toko baju",
+    "warung",
+    "sembako",
+    "kelontong",
+  ],
   brosur: ["company profile"],
   event: ["undangan", "wedding"],
 };

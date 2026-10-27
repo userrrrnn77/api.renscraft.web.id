@@ -777,7 +777,7 @@ export async function buildReferenceContext(
   const assetReferers = []; // halaman tempat tiap gambar ditemukan (untuk Referer)
   const assetLines = [];
   const seenImages = new Set();
-  let hasLabeledUploads = false;
+  let hasLabeledImages = false;
 
   // 1) User uploads — selalu duluan, prioritas tertinggi.
   //    Mereka udah di R2 (bukan hotlink), jadi nggak perlu di-mirror.
@@ -792,16 +792,21 @@ export async function buildReferenceContext(
     assets.push(url);
     assetReferers.push("");
 
+    const hasLabel = !!label && String(label).trim().length > 1;
+
     if (source === "unsplash") {
-      // Unsplash — perlu attribution di kode
-      const credit = photographer ? `by ${short(photographer, 40)}` : "";
-      const content = label ? ` — ${short(label, 60)}` : "";
+      const credit = photographer
+        ? ` (Unsplash by ${short(photographer, 40)})`
+        : " (Unsplash)";
+      if (hasLabel) hasLabeledImages = true;
       assetLines.push(
-        `- ${assetToken(assets.length)} (Unsplash ${credit}${content})`,
+        hasLabel
+          ? `- ${assetToken(assets.length)} = "${short(label, 60)}"${credit}`
+          : `- ${assetToken(assets.length)}${credit}`,
       );
     } else {
-      // Upload user biasa
       const useful = labelIsUseful(label);
+      if (useful) hasLabeledImages = true;
       const display = useful ? short(label, 60) : null;
       assetLines.push(
         display
@@ -861,8 +866,8 @@ export async function buildReferenceContext(
         ? 'If the user\'s message mentions an image URL that is listed below as "linked directly by the user", ' +
           "use that image's token, never the raw URL.\n"
         : "") +
-      (hasLabeledUploads
-        ? "\n### HARD RULE — matching uploaded images to cards\n" +
+      (hasLabeledImages
+        ? "\n### HARD RULE — matching labeled images to cards\n" +
           "1. For each product / menu / portfolio / team card, read its TITLE. Then find the token whose " +
           "label means the same thing. Use THAT token as the image src.\n" +
           '2. Example: card title "Nasi Goreng" + list has `ref-img-02 = "nasi goreng"` → ' +

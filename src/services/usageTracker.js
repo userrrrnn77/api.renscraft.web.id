@@ -28,12 +28,24 @@ export const getPricing = (env = process.env) => ({
   usdIdr: Number(env.USD_IDR) || 16500,
 });
 
+// C3: optional fast-model pricing.
+const getFastPricing = (env = process.env) => {
+  const inPerM = Number(env.AI_FAST_PRICE_IN_PER_M);
+  const outPerM = Number(env.AI_FAST_PRICE_OUT_PER_M);
+  if (!Number.isFinite(inPerM) || !Number.isFinite(outPerM)) return null;
+  return { inPerM, outPerM };
+};
+
 // Ringkas semua panggilan model dalam satu catatan.
 export function summarize(store, pricing = getPricing()) {
   let inputTokens = 0;
   let outputTokens = 0;
   let reasoningTokens = 0;
   const byLabel = {};
+  let usd = 0;
+
+  const fastPricing = getFastPricing();
+  const fastModelName = process.env.AI_MODEL_FAST || null;
 
   for (const c of store.calls) {
     inputTokens += c.in;
@@ -45,11 +57,18 @@ export function summarize(store, pricing = getPricing()) {
     slot.n++;
     slot.in += c.in;
     slot.out += c.out;
-  }
 
-  // outputTokens dari SDK sudah termasuk token reasoning, jadi tidak dijumlah lagi
-  const usd =
-    (inputTokens * pricing.inPerM + outputTokens * pricing.outPerM) / 1_000_000;
+    // C3: per-model pricing. A call recorded with `model` equal to the fast
+    // model name uses fast pricing when configured; everything else uses the
+    // default pricing.
+    const useFast =
+      fastPricing !== null &&
+      fastModelName !== null &&
+      c.model === fastModelName;
+    const inPerM = useFast ? fastPricing.inPerM : pricing.inPerM;
+    const outPerM = useFast ? fastPricing.outPerM : pricing.outPerM;
+    usd += (c.in * inPerM + c.out * outPerM) / 1_000_000;
+  }
 
   return {
     ts: new Date(store.start).toISOString(),
@@ -93,7 +112,12 @@ const defaultSink = async (summary) => {
 // Jalankan fn dengan satu catatan pemakaian. Kalau sudah ada catatan aktif
 // (mis. controller membungkus reviseProject + rewriteFile sekaligus), fn ikut
 // mencatat ke catatan luar itu dan tidak membuat baris baru.
-export async function withUsageTracking(kind, fn, meta = {}, { sink = defaultSink, pricing } = {}) {
+export async function withUsageTracking(
+  kind,
+  fn,
+  meta = {},
+  { sink = defaultSink, pricing } = {},
+) {
   if (als.getStore()) return fn();
 
   const store = {
@@ -126,7 +150,9 @@ export async function withUsageTracking(kind, fn, meta = {}, { sink = defaultSin
 
 // Panggil tepat setelah tiap panggilan model. `usage` = objek usage dari AI SDK.
 // Aman dipanggil di luar withUsageTracking (tidak melakukan apa-apa).
-export function recordUsage(label, usage) {
+// `modelName` dipakai C3 untuk per-model pricing; setiap field usage.jsonl
+// yang sudah ada tetap dipertahankan.
+export function recordUsage(label, usage, modelName = null) {
   const store = als.getStore();
   if (!store || !usage) return;
   store.calls.push({
@@ -134,6 +160,7 @@ export function recordUsage(label, usage) {
     in: num(usage.inputTokens),
     out: num(usage.outputTokens),
     reasoning: num(usage.outputTokenDetails?.reasoningTokens),
+    model: modelName ?? null,
   });
 }
 

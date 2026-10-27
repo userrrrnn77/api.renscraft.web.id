@@ -54,8 +54,11 @@ const cookieOptions = () => {
     secure: isProd,
     // SameSite=None WAJIB bareng Secure. Kalau dev, pakai "lax" biar cookie tetap jalan.
     sameSite: isProd ? "none" : "lax",
-    // Ini yang tadi kelewat: Domain supaya cookie bisa dibaca dari api.rensdev.my.id juga.
-    domain: isProd ? ".rensdev.my.id" : undefined,
+    // Ini yang tadi kelewat: Domain supaya cookie bisa dibaca dari api.renscraft.web.id juga.
+    domain: isProd
+      ? process.env.COOKIE_DOMAIN || ".renscraft.web.id"
+      : undefined,
+
     maxAge: 12 * 60 * 60 * 1000,
     path: "/api/admin",
   };

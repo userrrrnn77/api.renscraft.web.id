@@ -53,8 +53,27 @@ const EXTRA_LABEL_MIN = 2;
 const EXTRA_LABEL_MAX = 60;
 const NOT_FOUND = "Brief tidak ditemukan atau sudah kedaluwarsa";
 
+// Retry loop classifier: 3 attempt total, delay 2s lalu 4s antar attempt.
+// Kalau semua gagal, brief di-set "failed" dan client diminta retry.
+const CLASSIFY_MAX_ATTEMPTS = 3;
+const CLASSIFY_RETRY_DELAYS_MS = [2000, 4000];
+
 const isValidId = (id) => mongoose.isObjectIdOrHexString(id);
 
+// READ: pakai di GET /api/briefs/:id. "failed" ikut dibaca supaya client
+// bisa lihat status dan kasih toast. WRITE (PATCH) sengaja tidak boleh
+// menyentuh "failed" — brief yang gagal di klasifikasi gak bisa di-edit.
+async function findReadableBrief(req) {
+  const { id } = req.params;
+  if (!isValidId(id)) return null;
+  return Brief.findOne({
+    _id: id,
+    owner: req.user.userId,
+    status: { $in: ["classifying", "open", "failed"] },
+  });
+}
+
+// WRITE: pakai di PATCH /api/briefs/:id. Brief "failed" tidak bisa diubah.
 async function findOpenBrief(req) {
   const { id } = req.params;
   if (!isValidId(id)) return null;
@@ -102,7 +121,9 @@ const buildCatalogSlotDef = (s) => ({
               : null,
 });
 
-// Fallback kalau classifier gagal / belum selesai: tebak dari kata kunci dulu.
+// Bentuk awal sebelum classifier jalan. Slots ini cuma placeholder sementara —
+// akan diganti oleh hasil classifier kalau sukses. Kalau classifier gagal
+// total, brief ditandai "failed" dan client gak akan lihat slots ini.
 const fallbackResult = (prompt = "") => {
   const guess = guessCategory(prompt);
   // app_tool/dashboard tidak punya slot -> biar classifier yang memutuskan
@@ -116,20 +137,68 @@ const fallbackResult = (prompt = "") => {
 };
 
 // Jalan di background: client sudah dibalas "classifying" dan polling.
+// Retry up to CLASSIFY_MAX_ATTEMPTS kali sebelum menyerah. Kalau semua gagal,
+// brief di-set "failed" (bukan "open" dengan fallback) supaya client tahu
+// harus retry, dan user tidak jatuh ke wizard generic yang mungkin gak cocok.
 async function classifyInBackground(briefId, prompt) {
-  let result;
+  let result = null;
+  let lastError = null;
+
   try {
-    result = await withUsageTracking("brief", () => classifyPrompt(prompt), {
-      briefId: briefId.toString(),
-    });
-    console.log(`[Brief] classify done ${briefId} -> ${result.category}`);
-  } catch (err) {
-    console.warn(
-      `[Brief] classifier failed for ${briefId}, fallback: ${err?.message ?? err}`,
+    result = await withUsageTracking(
+      "brief",
+      async () => {
+        for (let attempt = 1; attempt <= CLASSIFY_MAX_ATTEMPTS; attempt++) {
+          try {
+            const r = await classifyPrompt(prompt);
+            console.log(
+              `[Brief] classify done ${briefId} -> ${r.category} (attempt ${attempt}/${CLASSIFY_MAX_ATTEMPTS})`,
+            );
+            return r;
+          } catch (err) {
+            lastError = err;
+            console.warn(
+              `[Brief] classify attempt ${attempt}/${CLASSIFY_MAX_ATTEMPTS} failed for ${briefId}: ${err?.message ?? err}`,
+            );
+            if (attempt < CLASSIFY_MAX_ATTEMPTS) {
+              const delay = CLASSIFY_RETRY_DELAYS_MS[attempt - 1] ?? 4000;
+              await new Promise((r) => setTimeout(r, delay));
+            }
+          }
+        }
+        throw lastError ?? new Error("classify failed: all attempts threw");
+      },
+      { briefId: briefId.toString() },
     );
-    result = fallbackResult();
+  } catch (err) {
+    console.error(
+      `[Brief] classify failed for ${briefId} after ${CLASSIFY_MAX_ATTEMPTS} attempts: ${err?.message ?? err}`,
+    );
+    try {
+      // Atomic: cuma set failed kalau brief masih "classifying". Kalau sudah
+      // diubah oleh proses lain (mis. edge case PATCH), jangan timpa.
+      const updated = await Brief.findOneAndUpdate(
+        { _id: briefId, status: "classifying" },
+        { $set: { status: "failed" } },
+        { returnDocument: "after" },
+      );
+      if (updated) {
+        console.log(`[Brief] marked failed ${briefId}`);
+      } else {
+        console.warn(
+          `[Brief] could not mark failed for ${briefId}: not in "classifying" state anymore`,
+        );
+      }
+    } catch (updateErr) {
+      // Kalau TTL keburu hapus, update gagal. Itu OK — brief hilang sendirinya.
+      console.error(
+        `[Brief] failed to mark failed for ${briefId}: ${updateErr?.message ?? updateErr}`,
+      );
+    }
+    return;
   }
 
+  // Success: simpan state open
   try {
     await Brief.findByIdAndUpdate(briefId, {
       category: result.category,
@@ -196,7 +265,7 @@ export const createBrief = asyncHandler(async (req, res) => {
     status: "classifying",
   });
 
-  // Classifier jalan sekali, di background. Tidak di-await.
+  // Classifier jalan di background (dengan retry). Tidak di-await.
   void classifyInBackground(brief._id, prompt);
 
   return res.json({
@@ -208,7 +277,7 @@ export const createBrief = asyncHandler(async (req, res) => {
 
 // GET /api/briefs/:id
 export const getBrief = asyncHandler(async (req, res) => {
-  const brief = await findOpenBrief(req);
+  const brief = await findReadableBrief(req);
   if (!brief) {
     return fail(res, 404, "BRIEF_NOT_FOUND", {}, NOT_FOUND);
   }

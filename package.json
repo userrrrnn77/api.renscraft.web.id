@@ -17,7 +17,7 @@
     "sync-deps": "cp -r node_modules /home/rendy/renscraft-server/",
     "sync-env": "cp .env /home/rendy/renscraft-server/.env",
     "restart-prod": "pm2 restart renscraft-api renscraft-ocr",
-    "sync-all": "bun run sync-deps && bun run sync-env && bun run restart-prod"
+    "sync-all": "pm2 stop renscraft-api && pm2 stop renscraft-ocr && bun run sync-deps && bun run sync-env && bun run restart-prod"
   },
   "keywords": [],
   "author": "rensdev",

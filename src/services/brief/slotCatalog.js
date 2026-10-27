@@ -11,13 +11,33 @@
 
 export const MAX_QUESTIONS = 5;
 
-export const VIBE_OPTIONS = [
-  "Modern minimalis",
-  "Vintage / hangat",
-  "Playful & berwarna",
-  "Elegan / mewah",
-  "Gelap & techy",
-];
+// Satu sumber kebenaran: urutan key = urutan chip di wizard, value = arahan ke model.
+export const VIBE_HINTS = {
+  "Modern minimalis":
+    "Bersih dan lega: banyak whitespace, sans-serif rapi, 1 warna aksen, border/shadow tipis, tanpa dekorasi berlebih.",
+  "Vintage / hangat":
+    "Retro hangat: palet krem/cokelat/mustard, font serif, tekstur halus, border tipis klasik.",
+  "Playful & berwarna":
+    "Ceria: warna cerah berani, rounded besar, bentuk organik, emoji/ilustrasi, animasi hover ringan.",
+  "Elegan / mewah":
+    "Mewah tenang: palet gelap/netral dengan aksen emas, serif tipis, letter-spacing lebar, spasi sangat lega.",
+  "Gelap & techy":
+    "Dark mode penuh: background hampir hitam, aksen neon (cyan/hijau/ungu), font mono sebagai aksen, glow tipis.",
+  "Glassmorphism / kaca blur":
+    "Panel kaca: bg-white/10, backdrop-blur-xl, border border-white/20, shadow lembut. WAJIB ada background gradient berwarna atau gambar di belakang panel, kalau tidak efeknya tidak terlihat.",
+  "Claymorphism / 3D lembut":
+    "Bentuk gemuk seperti tanah liat: rounded-3xl, shadow tebal berwarna + inner highlight terang, warna pastel, tombol menggembung.",
+  "Brutalism / tebal & mentah":
+    "Mentah dan tegas: border-4 border-black, warna kontras keras, font sangat besar dan tebal (mis. Space Grotesk / Space Mono), TANPA rounded (jangan pakai rounded-*), shadow keras offset (mis. shadow-[6px_6px_0_#000]). JANGAN pakai shadow-sm, border-zinc-100, gradient lembut, atau font Inter.",
+  "Neomorphism / timbul lembut":
+    "Timbul lembut: satu warna surface abu terang (mis. bg-[#e0e5ec]), shadow ganda terang+gelap, rounded besar, tanpa border; kontras teks tetap terbaca.",
+  "Skeuomorphism / realistis":
+    "Meniru objek fisik: gradient multi-stop, bevel/inner shadow, shadow berlapis, tekstur lewat gradient, tombol terlihat bisa ditekan.",
+  "Maximalism / ramai penuh":
+    "Ramai dan berlapis: banyak warna kontras, pola dan dekorasi, font display besar (mis. Syne / Bungee), elemen bertumpuk. JANGAN pakai whitespace lega ala minimalis atau palet zinc/netral.",
+};
+
+export const VIBE_OPTIONS = Object.keys(VIBE_HINTS);
 
 // kind: text | longtext | list | choice | phone | email | handle | url
 export const SLOTS = {

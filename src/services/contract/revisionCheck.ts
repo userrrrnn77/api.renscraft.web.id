@@ -12,6 +12,10 @@
 // Scope: only files the revision changed may be edited. The rest of the project
 // is read, never rewritten, apart from the two fixes that have to land in another
 // file (an export a touched file needs, a link a renamed id broke).
+//
+// C4: a derived contract has no design tokens. The project's current design is
+// whatever its files already contain; the revision prompt keeps everything it
+// does not need to touch, so no design block is rendered.
 import path from "node:path";
 import * as t from "@babel/types";
 import {
@@ -22,15 +26,15 @@ import {
   parseModule,
 } from "../../utils/astUtils.js";
 import {
-  REVISION_PASSES, //Module '"./contractChecker.js"' has no exported member 'REVISION_PASSES'.
+  REVISION_PASSES,
   checkContract,
   type ContractIssue,
 } from "./contractChecker.js";
 import { hashContent } from "../diff.js";
 import { fixStylesheets } from "./cssFix.js";
 import {
-  NAV_RE, //Module '"./projectContract.js"' declares 'NAV_RE' locally, but it is not exported.
-  NON_SECTION_RE, //Module '"./projectContract.js"' declares 'NON_SECTION_RE' locally, but it is not exported.
+  NAV_RE,
+  NON_SECTION_RE,
   THEME_EXPORTS,
   type FileContract,
   type ProjectContract,
@@ -118,6 +122,9 @@ export function deriveContract(files: Record<string, string>): ProjectContract {
     anchors: fileContracts.flatMap((f) => (f.sectionId ? [f.sectionId] : [])),
     // facts belong to the original plan; a revision may change them on purpose
     facts: {},
+    // C4: no design block for a derived contract, the current design is
+    // whatever the existing files already contain.
+    design: null,
   };
 }
 
@@ -147,7 +154,6 @@ export async function checkRevision(
   const check = checkContract(after, contract, {
     passes: REVISION_PASSES,
     scope: touched,
-    // Expected 2 arguments, but got 3.
   });
   result.files = check.files;
   result.changed = { ...check.fixed };

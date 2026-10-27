@@ -12,6 +12,11 @@ import { repairRevisionEntries } from "../services/contract/revisionCheck.js";
 import { decodeWhitespaceEntities } from "../services/contentNormalizer.js";
 import { extractUrls } from "../services/webReference.js";
 import { serializeProject } from "./projectController.js";
+import { resolveScope } from "../services/revisionScope.js";
+import {
+  buildAllowlist,
+  findInventedFacts,
+} from "../services/contract/factGuard.js";
 import {
   chargeCredits,
   creditCosts,
@@ -26,6 +31,7 @@ import {
 } from "../services/usageTracker.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { fail } from "../utils/apiError.js";
+import { ensureUnsplashCredits } from "../services/stockImages.js";
 
 const MAX_PROMPT_LENGTH = 4000;
 
@@ -40,6 +46,12 @@ export const buildManifest = (files) => {
   }
   return manifest;
 };
+
+// A2: history filter. The current prompt is already the last message, so it
+// is dropped from `recentMessages`, and so is the "Created file …" chatter
+// that floods the project's messages array during generation.
+const NOISE_RE =
+  /^(Created file |Planning project|Planned website structure|Website generation complete)/;
 
 const chatHandler = async (req, res) => {
   const prompt =
@@ -93,19 +105,12 @@ const chatHandler = async (req, res) => {
   }
 
   try {
-    // ... (sisa logika revision sama persis seperti aslinya, gua skip
-    //      bagian ini karena panjang dan tidak ada perubahan) ...
-
     project.messages.push({
       role: "user",
       content: prompt,
       timestamp: new Date(),
     });
     await project.save();
-
-    // ... semua logic heal, manifest, relevantFiles, recentMessages,
-    //     historyUrls, reviseProject, applyOperations, rewrite fallback,
-    //     repairRevisionEntries ... (TIDAK ADA PERUBAHAN)
 
     let healed = false;
     for (const [path, entry] of Object.entries(project.files || {})) {
@@ -124,16 +129,42 @@ const chatHandler = async (req, res) => {
       (f) => !AI_HIDDEN.has(f.path),
     );
 
+    // C2: revision scope. If the prompt names specific files/sections, only
+    // those go in `relevantFiles`; the rest stay in the manifest only.
+    // HARNESS_REVISION_SCOPE=0 disables the narrowing (mode "all").
+    const allPaths = Object.keys(project.files || {}).filter(
+      (p) => !AI_HIDDEN.has(p),
+    );
+    const scope =
+      process.env.HARNESS_REVISION_SCOPE !== "0"
+        ? resolveScope(prompt, allPaths)
+        : { mode: "all", files: new Set(allPaths), reason: "disabled" };
+    const scopeFiles = scope.mode === "files" ? scope.files : null;
+    if (scope.mode === "files") {
+      console.log(
+        `[RevisionScope] mode=files files=${[...scopeFiles].join(", ")} reason=${scope.reason}`,
+      );
+    } else {
+      console.log(`[RevisionScope] mode=all reason=${scope.reason}`);
+    }
+
     const relevantFiles = {};
     for (const [path, entry] of Object.entries(project.files || {})) {
       if (AI_HIDDEN.has(path)) continue;
+      if (scopeFiles && !scopeFiles.has(path)) continue;
       relevantFiles[path] = entry?.content ?? "";
     }
 
-    const recentMessages = project.messages.slice(-4).map((m) => ({
-      role: m.role,
-      content: m.content,
-    }));
+    // A2: clean history — current prompt excluded, chatter excluded, capped
+    // at the last 4 messages, each message at most 500 chars.
+    const recentMessages = (project.messages ?? [])
+      .slice(0, -1)
+      .filter((m) => !NOISE_RE.test(m.content))
+      .slice(-4)
+      .map((m) => ({
+        role: m.role,
+        content: String(m.content).slice(0, 500),
+      }));
 
     const historyUrls = extractUrls(
       project.messages
@@ -143,6 +174,10 @@ const chatHandler = async (req, res) => {
         .join("\n"),
     );
 
+    // A5.5: project.brief may be a Mongoose subdocument. Convert it to a plain
+    // object so buildBriefBlock sees a stable shape.
+    const briefSnapshot = project.brief?.toObject?.() ?? project.brief ?? null;
+
     const result = await reviseProject(
       prompt,
       manifest,
@@ -150,6 +185,11 @@ const chatHandler = async (req, res) => {
       recentMessages,
       historyUrls,
       project.uploadedImages || [],
+      {
+        brief: briefSnapshot,
+        concept: project.description,
+        scope,
+      },
     );
 
     console.log(
@@ -184,6 +224,7 @@ const chatHandler = async (req, res) => {
             allPaths: [...new Set([...Object.keys(updatedFiles), p])],
             assets: result.assets,
             referenceContext: result.referenceContext,
+            briefBlock: result.briefBlock,
           });
           updatedFiles[p] = { content: code, hash: hashContent(code) };
           applied.push(`rewrote ${p}`);
@@ -206,8 +247,33 @@ const chatHandler = async (req, res) => {
       console.warn(`[Diff] Errors applying operations: `, errors);
     }
 
+    const zeroOperations = (result.operations || []).length === 0;
     const nothingApplied = applied.length === 0;
-    if (nothingApplied) markUsageFailed(new Error("no operations applied"));
+    if (zeroOperations || nothingApplied) {
+      markUsageFailed(
+        new Error(zeroOperations ? "zero operations" : "no operations applied"),
+      );
+    }
+
+    // Unsplash credits: dipasang server, bukan LLM.
+    if (!nothingApplied && result.stockAssets?.length) {
+      const plain = Object.fromEntries(
+        Object.entries(updatedFiles).map(([p, f]) => [p, f?.content ?? ""]),
+      );
+      const credits = ensureUnsplashCredits(plain, result.stockAssets);
+      for (const p of credits.changed) {
+        updatedFiles[p] = {
+          content: credits.files[p],
+          hash: hashContent(credits.files[p]),
+        };
+        applied.push(`credits ${p}`);
+      }
+      if (credits.changed.length) {
+        console.log(
+          `[Unsplash] credits updated: ${credits.changed.join(", ")}`,
+        );
+      }
+    }
 
     let finalFiles = updatedFiles;
     let autoFixes = [];
@@ -243,25 +309,101 @@ const chatHandler = async (req, res) => {
       project.version += 1;
       project.creditsHeld = 0;
     }
+
+    // C1 log-only for revisions: after applyOperations, scan the touched files
+    // against the brief + concept + revision prompt allowlist. Never blocks.
+    // HARNESS_FACT_GUARD=0 disables it.
+    if (
+      process.env.HARNESS_FACT_GUARD !== "0" &&
+      briefSnapshot &&
+      !nothingApplied
+    ) {
+      try {
+        const sources = [
+          String(project.description ?? ""),
+          String(prompt ?? ""),
+          String(result.referenceContext ?? ""),
+        ];
+        const answers = briefSnapshot?.answers ?? {};
+        const slots = Array.isArray(briefSnapshot?.slots)
+          ? briefSnapshot.slots
+          : [];
+        for (const slot of slots) {
+          const v = answers[slot.key]?.value;
+          if (typeof v === "string" && v.trim()) sources.push(v);
+          if (typeof slot.placeholder === "string" && slot.placeholder.trim()) {
+            sources.push(slot.placeholder);
+          }
+        }
+        const allow = buildAllowlist(sources);
+        const touchedPaths = new Set();
+        for (const op of result.operations || []) {
+          if (op.path) touchedPaths.add(op.path);
+        }
+        for (const a of applied) {
+          const m = a.match(/(?:created|updated|deleted|rewrote) (\S+)/);
+          if (m) touchedPaths.add(m[1]);
+        }
+        let warned = 0;
+        for (const p of touchedPaths) {
+          const code = project.files?.[p]?.content;
+          if (typeof code !== "string") continue;
+          const facts = findInventedFacts(code, allow);
+          if (facts.length > 0) {
+            warned++;
+            console.warn(
+              `[FactGuard] revision ${p}: ${facts.length} potential invented fact(s): ${JSON.stringify(
+                facts.map((f) => ({
+                  kind: f.kind,
+                  value: f.value,
+                  line: f.line,
+                })),
+              )}`,
+            );
+          }
+        }
+        if (warned === 0) {
+          console.log(
+            `[FactGuard] revision: no potential invented facts in touched files`,
+          );
+        }
+      } catch (err) {
+        console.warn(`[FactGuard] revision check failed: ${err.message}`);
+      }
+    }
+
     project.status = "completed";
     project.error = null;
-    // Revision yang nggak ngubah apa-apa tetap dianggap "completed" tapi
-    // dengan errorCode khusus, biar client bisa nampilin pesan yang jelas.
-    project.errorCode = nothingApplied ? "REVISION_NO_CHANGE" : null;
+    project.errorCode =
+      zeroOperations || nothingApplied ? "REVISION_NO_CHANGE" : null;
+
+    // B3: distinguish "the model returned zero operations" from "operations
+    // existed but none could be applied".
+    let assistantMessage;
+    if (zeroOperations) {
+      assistantMessage = `AI tidak menghasilkan perubahan: ${
+        result.description || "tidak ada perubahan yang bisa diterapkan"
+      }`;
+    } else if (nothingApplied) {
+      assistantMessage =
+        "Perubahan belum berhasil diterapkan (AI salah menunjuk bagian kode). Coba kirim ulang permintaannya, atau sebutkan bagian yang mau diubah lebih spesifik.";
+    } else {
+      assistantMessage =
+        result.description +
+        (errors.length > 0
+          ? `\n\n Some operations failed: ${errors.join(", ")}`
+          : "");
+    }
 
     project.messages.push({
       role: "assistant",
-      content: nothingApplied
-        ? "Perubahan belum berhasil diterapkan (AI salah menunjuk bagian kode). Coba kirim ulang permintaannya, atau sebutkan bagian yang mau diubah lebih spesifik."
-        : result.description +
-          (errors.length > 0
-            ? `\n\n Some operations failed: ${errors.join(", ")}`
-            : ""),
+      content: assistantMessage,
     });
 
     await project.save();
 
-    const refunded = nothingApplied ? await refundHeld(project._id) : 0;
+    const refunded =
+      zeroOperations || nothingApplied ? await refundHeld(project._id) : 0;
 
     res.json({
       ...serializeProject(project),
@@ -289,8 +431,6 @@ const chatHandler = async (req, res) => {
 
     const refunded = await refundHeld(project._id);
 
-    // err.message tetap dikirim sebagai `error` (fallback English/debug),
-    // tapi client bakal pakai `code` buat translate.
     res.status(500).json({
       error: err.message || "Failed to process revision request",
       code: "CHAT_FAILED",

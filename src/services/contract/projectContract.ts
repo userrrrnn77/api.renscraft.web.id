@@ -33,11 +33,20 @@ export interface PlanFacts {
   foundedYear?: string | number;
 }
 
+// C4: design tokens. All fields optional on the planner side; defaults are
+// applied in applyContractToPlan.
+export interface PlanDesign {
+  accent?: string;
+  font?: string;
+  radius?: string;
+}
+
 export interface ProjectPlan {
   files: PlanFile[];
   projectName: string;
   projectDescription: string;
   facts?: PlanFacts;
+  design?: PlanDesign;
 }
 
 // ── Contract ────────────────────────────────────────────────────────────────
@@ -52,6 +61,15 @@ export interface FileContract {
   sectionId: string | null;
 }
 
+// C4: design tokens. Non-null for a fresh generation (defaults applied).
+// null for a derived contract (revision): the project's current design is
+// whatever its files already contain, so no design block is rendered.
+export interface DesignTokens {
+  accent: string;
+  font: string;
+  radius: string;
+}
+
 export interface ProjectContract {
   entryPath: string;
   needsTheme: boolean;
@@ -60,11 +78,28 @@ export interface ProjectContract {
   // ids that nav/footer links may point to
   anchors: string[];
   facts: Record<string, string>;
+  design: DesignTokens | null;
 }
 
-export const THEME_EXPORTS = ["ThemeContext", "ThemeProvider", "useTheme"] as const;
-export const THEME_VALUE_KEYS = ["theme", "isDark", "setTheme", "toggleTheme"] as const;
+export const THEME_EXPORTS = [
+  "ThemeContext",
+  "ThemeProvider",
+  "useTheme",
+] as const;
+export const THEME_VALUE_KEYS = [
+  "theme",
+  "isDark",
+  "setTheme",
+  "toggleTheme",
+] as const;
 const DEFAULT_THEME_PATH = "/context/ThemeContext.js";
+
+// C4: defaults when the planner omits design (or leaves a field empty).
+export const DEFAULT_DESIGN: DesignTokens = {
+  accent: "indigo-600",
+  font: "Inter",
+  radius: "rounded-2xl",
+};
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -92,7 +127,10 @@ export function parseExports(
   spec: string | undefined,
   filePath: string,
 ): { defaultExport: string | null; namedExports: string[] } {
-  const result = { defaultExport: null as string | null, namedExports: [] as string[] };
+  const result = {
+    defaultExport: null as string | null,
+    namedExports: [] as string[],
+  };
   if (!isJs(filePath)) return result;
 
   const text = String(spec ?? "").trim();
@@ -100,7 +138,9 @@ export function parseExports(
     for (const rawToken of text.split(/[,;]|\band\b/i)) {
       const token = rawToken.trim();
       if (!token) continue;
-      const def = token.match(/^(?:export\s+)?default(?:\s+(?:function|class|const))?(?:\s+([A-Za-z_$][\w$]*))?$/i);
+      const def = token.match(
+        /^(?:export\s+)?default(?:\s+(?:function|class|const))?(?:\s+([A-Za-z_$][\w$]*))?$/i,
+      );
       if (def) {
         result.defaultExport = def[1] ?? baseName(filePath);
         continue;
@@ -116,7 +156,10 @@ export function parseExports(
 
   // /App.js always needs a default export; so does every component
   if (!result.defaultExport && result.namedExports.length === 0) {
-    if (/^\/App\.jsx?$/i.test(norm(filePath)) || /\/components\//i.test(filePath)) {
+    if (
+      /^\/App\.jsx?$/i.test(norm(filePath)) ||
+      /\/components\//i.test(filePath)
+    ) {
       result.defaultExport = baseName(filePath);
     }
   }
@@ -251,7 +294,8 @@ export default ThemeProvider;
 // ── plan -> contract ────────────────────────────────────────────────────────
 
 export const NAV_RE = /^(header|navbar|nav|navigation|topbar|menubar)$/i;
-export const NON_SECTION_RE = /^(header|navbar|nav|navigation|topbar|menubar|footer|sidebar|modal|button|card|logo|themetoggle|themeprovider|themecontext)$/i;
+export const NON_SECTION_RE =
+  /^(header|navbar|nav|navigation|topbar|menubar|footer|sidebar|modal|button|card|logo|themetoggle|themeprovider|themecontext)$/i;
 
 function cleanFacts(facts: PlanFacts | undefined): Record<string, string> {
   const out: Record<string, string> = {};
@@ -260,6 +304,20 @@ function cleanFacts(facts: PlanFacts | undefined): Record<string, string> {
     if (text) out[key] = text;
   }
   return out;
+}
+
+// C4: merge the planner's design (may be partial) with the defaults.
+function cleanDesign(raw: PlanDesign | undefined): DesignTokens {
+  const src = raw ?? {};
+  const pick = (v: unknown, fallback: string): string => {
+    const t = String(v ?? "").trim();
+    return t.length > 0 ? t.slice(0, 60) : fallback;
+  };
+  return {
+    accent: pick(src.accent, DEFAULT_DESIGN.accent),
+    font: pick(src.font, DEFAULT_DESIGN.font),
+    radius: pick(src.radius, DEFAULT_DESIGN.radius),
+  };
 }
 
 export function applyContractToPlan(
@@ -277,7 +335,8 @@ export function applyContractToPlan(
   let themePath: string | null = null;
   if (needsTheme) {
     const planned = files.find(
-      (f) => isJs(f.path) && /^theme(context|provider)$/i.test(baseName(f.path)),
+      (f) =>
+        isJs(f.path) && /^theme(context|provider)$/i.test(baseName(f.path)),
     );
     themePath = planned?.path ?? DEFAULT_THEME_PATH;
     const entry = {
@@ -294,7 +353,9 @@ export function applyContractToPlan(
   }
 
   // 2. which components are page sections that nav links can point to
-  const hasNav = files.some((f) => isJs(f.path) && NAV_RE.test(baseName(f.path)));
+  const hasNav = files.some(
+    (f) => isJs(f.path) && NAV_RE.test(baseName(f.path)),
+  );
   const sectionFiles = files.filter(
     (f) =>
       hasNav &&
@@ -302,7 +363,9 @@ export function applyContractToPlan(
       /^\/components\//i.test(f.path) &&
       !NON_SECTION_RE.test(baseName(f.path)),
   );
-  const sectionIds = new Map(sectionFiles.map((f) => [f.path, kebab(baseName(f.path))]));
+  const sectionIds = new Map(
+    sectionFiles.map((f) => [f.path, kebab(baseName(f.path))]),
+  );
 
   // 3. per-file contract
   const contractFiles: FileContract[] = files.map((f) => {
@@ -316,7 +379,8 @@ export function applyContractToPlan(
     };
   });
 
-  const entry = files.find((f) => /^\/App\.jsx?$/i.test(f.path))?.path ?? "/App.js";
+  const entry =
+    files.find((f) => /^\/App\.jsx?$/i.test(f.path))?.path ?? "/App.js";
 
   return {
     plan: { ...rawPlan, files },
@@ -327,6 +391,7 @@ export function applyContractToPlan(
       files: contractFiles,
       anchors: [...sectionIds.values()],
       facts: cleanFacts(rawPlan.facts),
+      design: cleanDesign(rawPlan.design),
     },
   };
 }
@@ -336,7 +401,9 @@ export function applyContractToPlan(
 function importLine(from: string, fc: FileContract): string | null {
   if (!fc.defaultExport && fc.namedExports.length === 0) return null;
   const src = relImport(from, fc.path);
-  const named = fc.namedExports.length ? `{ ${fc.namedExports.join(", ")} }` : "";
+  const named = fc.namedExports.length
+    ? `{ ${fc.namedExports.join(", ")} }`
+    : "";
   const parts = [fc.defaultExport ?? "", named].filter(Boolean).join(", ");
   return `import ${parts} from '${src}';`;
 }
@@ -359,7 +426,9 @@ export function renderContractPrompt(
       fc.defaultExport ? `default ${fc.defaultExport}` : null,
       ...fc.namedExports.map((n) => `named ${n}`),
     ].filter(Boolean);
-    const who = fc.serverContent ? " [written by the server, do NOT write it]" : "";
+    const who = fc.serverContent
+      ? " [written by the server, do NOT write it]"
+      : "";
     const imp =
       fc.path === me?.path || fc.path === contract.entryPath
         ? null
@@ -377,7 +446,9 @@ export function renderContractPrompt(
       );
     }
     for (const n of me.namedExports) {
-      lines.push(`- It MUST export \`${n}\` with the \`export\` keyword (\`export const ${n} = ...\`). A declaration without \`export\` breaks every file that imports it.`);
+      lines.push(
+        `- It MUST export \`${n}\` with the \`export\` keyword (\`export const ${n} = ...\`). A declaration without \`export\` breaks every file that imports it.`,
+      );
     }
     lines.push(
       "- Import only names that other files really export (list above). Never import a name that is not listed.",
@@ -405,7 +476,9 @@ export function renderContractPrompt(
 
   if (contract.anchors.length > 0) {
     lines.push("", "### Anchors");
-    lines.push(`- Section ids that exist: ${contract.anchors.map((a) => `#${a}`).join(", ")}.`);
+    lines.push(
+      `- Section ids that exist: ${contract.anchors.map((a) => `#${a}`).join(", ")}.`,
+    );
     if (me?.sectionId) {
       lines.push(
         `- The root element of this file MUST be \`<section id='${me.sectionId}'>\` (keep that exact id).`,
@@ -420,8 +493,25 @@ export function renderContractPrompt(
 
   const facts = Object.entries(contract.facts);
   if (facts.length > 0) {
-    lines.push("", "### Shared facts (use EXACTLY these values in every file, never invent different ones)");
+    lines.push(
+      "",
+      "### Shared facts (use EXACTLY these values in every file, never invent different ones)",
+    );
     for (const [k, v] of facts) lines.push(`- ${k}: ${v}`);
+  }
+
+  // C4: design tokens. Identical for every file of one generation, so the accent
+  // and font cannot drift file to file. Omitted when the contract was derived
+  // from existing files (revision): the project's current design is what its
+  // files already contain.
+  if (contract.design) {
+    lines.push(
+      "",
+      "### Design tokens (use EXACTLY these values in every file; do not pick another accent or font)",
+      `- Accent: ${contract.design.accent} (use for every accent color: primary buttons, active states, gradient text stops, key highlights)`,
+      `- Font: ${contract.design.font} (import from Google Fonts in /styles.css and set it on body)`,
+      `- Radius: ${contract.design.radius} (use for cards, panels, buttons, inputs)`,
+    );
   }
 
   return lines.join("\n");

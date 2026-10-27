@@ -58,7 +58,11 @@ const BriefSchema = new Schema(
     questionKeys: { type: [String], default: [] },
     status: {
       type: String,
-      enum: ["classifying", "open", "used"],
+      // "classifying" = classifier masih jalan (retry loop di background)
+      // "open"        = classifier sukses, wizard siap
+      // "failed"      = 3 attempt gagal, brief tidak bisa dilanjutkan
+      // "used"        = user sudah tekan Generate, brief dikonsumsi project
+      enum: ["classifying", "open", "failed", "used"],
       default: "open",
     },
   },

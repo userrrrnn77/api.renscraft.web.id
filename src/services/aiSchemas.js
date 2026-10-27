@@ -46,6 +46,16 @@ export const FilePlanSchema = z.object({
       foundedYear: z.union([z.string(), z.number()]).optional(),
     })
     .optional(),
+  // C4: design tokens, so every generated file uses the same accent and font.
+  // Optional; applyContractToPlan fills the defaults when the planner omits
+  // them or leaves a field empty.
+  design: z
+    .object({
+      accent: z.string().max(60).optional(),
+      font: z.string().max(60).optional(),
+      radius: z.string().max(60).optional(),
+    })
+    .optional(),
 });
 
 export const FileCodeSchema = z.object({

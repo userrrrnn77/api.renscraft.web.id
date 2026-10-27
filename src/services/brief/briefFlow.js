@@ -50,6 +50,7 @@ export function buildState(brief) {
     ? [...brief.questionKeys]
     : [];
   const defs = slotDefsOf(brief);
+  const failed = brief.status === "failed";
 
   const slots = defs.map((d) => {
     const entry = answers[d.key] ?? null;
@@ -70,8 +71,10 @@ export function buildState(brief) {
   return {
     briefId: String(brief._id),
     status: brief.status,
-    mode: questionKeys.length > 0 ? "wizard" : "ready",
-    autoStart: questionKeys.length === 0,
+    // "failed" adalah terminal state: client tidak boleh jatuh ke wizard atau
+    // auto-generate. FE wajib cek status ini sebelum autoStart.
+    mode: failed ? "failed" : questionKeys.length > 0 ? "wizard" : "ready",
+    autoStart: !failed && questionKeys.length === 0,
     category: { id: cat.id, label: cat.label },
     sampleData: cat.sampleData === true,
     slots,

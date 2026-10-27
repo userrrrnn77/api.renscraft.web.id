@@ -12,7 +12,7 @@
 // Katalog static (SLOTS, CATEGORIES) tetap ada, tapi perannya berubah: jadi
 // "vocabulary hint" untuk model, bukan sumber kebenaran pertanyaan.
 import { z } from "zod";
-import { generateObjectTracked, model } from "../ai.js";
+import { generateObjectTracked, fastModel, FAST_MODEL_NAME } from "../ai.js";
 import { briefConfig } from "./briefConfig.js";
 import { normalizeAnswer } from "./slotValidate.js";
 import {
@@ -114,6 +114,14 @@ Prompt: "undangan pernikahan Rina & Dimas"
 → Kategori: event
 → Yang penting: nama pasangan (ada), tanggal, lokasi, RSVP. Tambahan: love story → section khas undangan modern.
 → Output: brand_name, tanggal, address, rsvp, x_love_story (longtext), vibe
+
+## ATURAN KHUSUS URL (SANGAT PENTING)
+Jika prompt user menyertakan URL (misal: "buat ini lebih menarik: https://..."), sistem backend akan otomatis melakukan scraping data dari URL tersebut (teks, gambar, design tokens).
+OLEH KARENA ITU:
+- JANGAN buat slot/pertanyaan untuk menanyakan data fakta (nama, profesi, bio, email, nomor telepon, alamat, project, dll) karena sistem sudah mengambilnya dari URL tersebut.
+- ANGGAP SEMUA DATA FAKTA SUDAH ADA DI URL TERSEBUT.
+- Hanya buat slot 'vibe' (gaya tampilan) atau slot 'x_' (jika user memberikan instruksi spesifik yang tidak ada di web).
+- Jika user HANYA memberikan URL tanpa instruksi tambahan, cukup buat 1 slot saja: 'vibe'.
 
 ## ATURAN KERAS
 
@@ -282,19 +290,22 @@ function cleanSlots(rawSlots, extracted, prompt) {
     const isCatalog = CATALOG_KEYS.has(key);
     if (!isCatalog && !EXTRA_KEY_RE.test(key)) continue;
 
-    const kind = s.kind;
-    const group = s.group === "style" ? "style" : "fact";
+    const isVibe = key === "vibe";
+    const kind = isVibe ? "choice" : s.kind;
+    const group = isVibe || s.group === "style" ? "style" : "fact";
     const placeholder = String(s.placeholder ?? "")
       .trim()
       .slice(0, 120);
-    const options =
-      kind === "choice" && Array.isArray(s.options) && s.options.length > 0
+    // vibe: opsi SELALU dari kode, jangan percaya output composer
+    const options = isVibe
+      ? VIBE_OPTIONS
+      : kind === "choice" && Array.isArray(s.options) && s.options.length > 0
         ? s.options
             .map((o) => String(o).trim())
             .filter(Boolean)
             .slice(0, 10)
         : kind === "choice"
-          ? VIBE_OPTIONS // fallback kalau composer lupa
+          ? VIBE_OPTIONS
           : [];
 
     seen.add(key);
@@ -357,13 +368,97 @@ function cleanExtracted(slots, extracted, prompt) {
   return answers;
 }
 
+// B2: pure resolver. Kept exported so the table can be checked without a model.
+export function resolveCategory({
+  modelCategory,
+  confidence,
+  keywordGuess,
+  minConfidence,
+}) {
+  // (1) Model said "lainnya" but keywords clearly point somewhere.
+  if (modelCategory === "lainnya" && keywordGuess) return keywordGuess;
+  // (2) Model is confident: trust it.
+  if (confidence >= minConfidence) return modelCategory;
+  // (3) Low confidence, keywords disagree with the model: use keywords.
+  if (keywordGuess && keywordGuess !== modelCategory) return keywordGuess;
+  // (4) Low confidence, no keyword evidence: trust the model.
+  return modelCategory;
+}
+
+// B2: generic fallback. Only injected when category is "lainnya" and the
+// composed slots contain no fact slot besides brand_name.
+const DEFAULT_BRAND_NAME_SLOT = {
+  key: "brand_name",
+  label: "Nama brand / judul",
+  question: "Nama website atau brand-nya apa?",
+  kind: "text",
+  group: "fact",
+  placeholder: "Nama Brand",
+  options: [],
+  mapsTo: "businessName",
+};
+
+const DEFAULT_VIBE_SLOT = {
+  key: "vibe",
+  label: "Gaya tampilan",
+  question: "Mau nuansanya gimana?",
+  kind: "choice",
+  group: "style",
+  placeholder: "",
+  options: [...VIBE_OPTIONS],
+  mapsTo: null,
+};
+
+function injectGenericFallback(category, rawSlots) {
+  if (category !== "lainnya") return rawSlots;
+  const slots = Array.isArray(rawSlots) ? rawSlots : [];
+  const hasFactSlot = slots.some((s) => {
+    const group = s.group ?? "fact";
+    return group !== "style" && s.key !== "brand_name";
+  });
+  if (hasFactSlot) return slots;
+
+  const brandName =
+    slots.find((s) => s.key === "brand_name") ?? DEFAULT_BRAND_NAME_SLOT;
+  const vibe = slots.find((s) => s.key === "vibe") ?? DEFAULT_VIBE_SLOT;
+  const middle = slots.filter((s) => s !== brandName && s !== vibe);
+
+  return [
+    brandName,
+    {
+      key: "whatsapp",
+      label: "WhatsApp",
+      question: "Nomor WA untuk dihubungi?",
+      kind: "phone",
+      group: "fact",
+      placeholder: "Nomor WhatsApp belum diisi",
+      options: [],
+      mapsTo: "phone",
+    },
+    {
+      key: "address",
+      label: "Alamat",
+      question: "Alamat lengkapnya di mana?",
+      kind: "longtext",
+      group: "fact",
+      placeholder: "Alamat belum diisi",
+      options: [],
+      mapsTo: "address",
+    },
+    ...middle,
+    vibe,
+  ];
+}
+
 // ── API ─────────────────────────────────────────────────────────────────────
 
 export async function classifyPrompt(prompt) {
   const cfg = briefConfig();
 
+  // C3: brief is a "small call", use the fast model when configured.
   const { object } = await generateObjectTracked("brief", {
-    model,
+    model: fastModel,
+    modelName: FAST_MODEL_NAME || undefined,
     schema: ComposerSchema,
     system: buildSystem(),
     prompt: `Prompt user:\n"""\n${prompt.slice(0, 2000)}\n"""`,
@@ -371,68 +466,21 @@ export async function classifyPrompt(prompt) {
     abortSignal: AbortSignal.timeout(cfg.classifyTimeoutMs),
   });
 
-  let category = object.category;
-  let rawSlots = object.slots;
-  let extracted = object.extracted;
-
-  // Kata kunci di prompt = bukti kedua, dipakai sebagai penengah.
   const guess = guessCategory(prompt);
-  const unsure = object.confidence < cfg.minConfidence && guess !== category;
+  const category = resolveCategory({
+    modelCategory: object.category,
+    confidence: object.confidence,
+    keywordGuess: guess,
+    minConfidence: cfg.minConfidence,
+  });
+
   console.log(
-    `[Brief] classify raw: model=${object.category} conf=${object.confidence} keyword=${guess ?? "-"} unsure=${unsure}`,
+    `[Brief] classify raw: model=${object.category} conf=${object.confidence} keyword=${guess ?? "-"} -> category=${category}`,
   );
 
-  if (unsure) {
-    // Model ragu & kata kunci tidak sejalan → "lainnya" + slots generic.
-    category = "lainnya";
-    rawSlots = [
-      {
-        key: "brand_name",
-        label: "Nama brand / judul",
-        question: "Nama website atau brand-nya apa?",
-        kind: "text",
-        group: "fact",
-        placeholder: "Nama Brand",
-        options: [],
-        mapsTo: "businessName",
-      },
-      {
-        key: "whatsapp",
-        label: "WhatsApp",
-        question: "Nomor WA untuk dihubungi?",
-        kind: "phone",
-        group: "fact",
-        placeholder: "Nomor WhatsApp belum diisi",
-        options: [],
-        mapsTo: "phone",
-      },
-      {
-        key: "address",
-        label: "Alamat",
-        question: "Alamat lengkapnya di mana?",
-        kind: "longtext",
-        group: "fact",
-        placeholder: "Alamat belum diisi",
-        options: [],
-        mapsTo: "address",
-      },
-      {
-        key: "vibe",
-        label: "Gaya tampilan",
-        question: "Mau nuansanya gimana?",
-        kind: "choice",
-        group: "style",
-        options: [...VIBE_OPTIONS],
-        mapsTo: null,
-      },
-    ];
-  } else if (category === "lainnya" && guess) {
-    // Model bilang "lainnya" padahal kata kuncinya jelas → pakai tebakan.
-    category = guess;
-  }
-
-  const slots = cleanSlots(rawSlots, extracted, prompt);
-  const answers = cleanExtracted(slots, extracted, prompt);
+  const rawSlots = injectGenericFallback(category, object.slots);
+  const slots = cleanSlots(rawSlots, object.extracted, prompt);
+  const answers = cleanExtracted(slots, object.extracted, prompt);
 
   return { category, confidence: object.confidence, slots, answers };
 }
