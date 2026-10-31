@@ -14,6 +14,7 @@ import {
 } from "../services/payments/manualPayment.js";
 import mongoose from "mongoose";
 import { RedeemCode } from "../models/RedeemCode.js";
+import { DynamicApp } from "../models/DynamicApp.js";
 
 // ─── Rate limit in-memory ───────────────────────────────────────────────────
 const loginAttempts = new Map();
@@ -515,4 +516,103 @@ export const adminDeleteRedeemCode = asyncHandler(async (req, res) => {
     `[Admin] Deleted redeem code ${result.code} (${result.redemptionCount}/${result.maxRedemptions} used)`,
   );
   res.json({ ok: true });
+});
+
+// ─── Dynamic Apps (suspend / restore) ───────────────────────────────────────
+
+// GET /api/admin/dynamic?page=1&limit=25&status=published|draft|suspended|archived
+export const adminListDynamicApps = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = paginate(req);
+  const status = String(req.query.status || "").trim();
+
+  const filter = status ? { status } : {};
+
+  const [apps, total] = await Promise.all([
+    DynamicApp.find(filter)
+      .sort({ updatedAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .select("-publishedFiles")
+      .populate("ownerId", "name email")
+      .populate("sourceProjectId", "name status published")
+      .lean(),
+    DynamicApp.countDocuments(filter),
+  ]);
+
+  res.json({ apps, total, page, limit });
+});
+
+// POST /api/admin/dynamic/:id/suspend  { reason? }
+export const adminSuspendDynamicApp = asyncHandler(async (req, res) => {
+  const id = String(req.params.id || "");
+  if (!mongoose.isObjectIdOrHexString(id)) {
+    return fail(res, 400, "ADMIN_INVALID_APP_ID", {}, "Invalid app id");
+  }
+
+  const reason = String(req.body?.reason ?? "")
+    .slice(0, 300)
+    .trim();
+
+  const app = await DynamicApp.findOneAndUpdate(
+    { _id: id, status: { $in: ["draft", "published"] } },
+    { $set: { status: "suspended" } },
+    { returnDocument: "after", projection: { publishedFiles: 0 } },
+  ).lean();
+
+  if (!app) {
+    const existing = await DynamicApp.findById(id).select("status").lean();
+    if (!existing) {
+      return fail(res, 404, "ADMIN_APP_NOT_FOUND", {}, "App not found");
+    }
+    return fail(
+      res,
+      409,
+      "ADMIN_APP_NOT_SUSPENDABLE",
+      { status: existing.status },
+      `App is already ${existing.status}`,
+    );
+  }
+
+  console.log(
+    `[Admin] Suspended dynamic app ${app.slug} (${app._id})${reason ? `: ${reason}` : ""}`,
+  );
+
+  res.json({ ok: true, app });
+});
+
+// POST /api/admin/dynamic/:id/restore
+//
+// Suspended app selalu kembali ke "draft". Owner harus publish ulang untuk
+// live lagi — ini kasih kesempatan admin review sebelum kontennya publik.
+// Sengaja tidak "auto-publish" balik ke status sebelumnya: kalau suspend
+// karena ada masalah konten, kita tidak mau app otomatis live lagi.
+export const adminRestoreDynamicApp = asyncHandler(async (req, res) => {
+  const id = String(req.params.id || "");
+  if (!mongoose.isObjectIdOrHexString(id)) {
+    return fail(res, 400, "ADMIN_INVALID_APP_ID", {}, "Invalid app id");
+  }
+
+  const app = await DynamicApp.findOneAndUpdate(
+    { _id: id, status: "suspended" },
+    { $set: { status: "draft" } },
+    { returnDocument: "after", projection: { publishedFiles: 0 } },
+  ).lean();
+
+  if (!app) {
+    const existing = await DynamicApp.findById(id).select("status").lean();
+    if (!existing) {
+      return fail(res, 404, "ADMIN_APP_NOT_FOUND", {}, "App not found");
+    }
+    return fail(
+      res,
+      409,
+      "ADMIN_APP_NOT_RESTORABLE",
+      { status: existing.status },
+      `App is ${existing.status}, not suspended`,
+    );
+  }
+
+  console.log(`[Admin] Restored dynamic app ${app.slug} (${app._id}) to draft`);
+
+  res.json({ ok: true, app });
 });

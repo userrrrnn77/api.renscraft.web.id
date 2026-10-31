@@ -59,6 +59,9 @@ const camelWords = (name) =>
 
 export function resolveScope(prompt, paths) {
   const list = Array.from(paths || []);
+
+  const safeList = list.filter((p) => p !== "/lib/renscraft.js");
+
   const words = new Set(wordsOf(prompt));
   const lower = String(prompt).toLowerCase();
 
@@ -70,12 +73,18 @@ export function resolveScope(prompt, paths) {
     const intent = GLOBAL_INTENTS.find((i) =>
       new RegExp(`\\b${i.replace(/\s+/g, "\\s+")}\\b`, "i").test(prompt),
     );
-    return { mode: "all", files: new Set(list), reason: `global:${intent}` };
+    // Ganti list jadi safeList
+    return {
+      mode: "all",
+      files: new Set(safeList),
+      reason: `global:${intent}`,
+    };
   }
-  
+
   const matches = new Set();
 
-  for (const p of list) {
+  // Ganti list jadi safeList
+  for (const p of safeList) {
     const base = baseNameOf(p);
     if (camelWords(base).some((w) => words.has(w))) {
       matches.add(p);
@@ -89,13 +98,13 @@ export function resolveScope(prompt, paths) {
   }
 
   if (matches.size === 0) {
-    return { mode: "all", files: new Set(list), reason: "no-match" };
+    return { mode: "all", files: new Set(safeList), reason: "no-match" };
   }
 
-  if (APP_SECTION_HINTS.test(prompt) && list.includes("/App.js")) {
+  if (APP_SECTION_HINTS.test(prompt) && safeList.includes("/App.js")) {
     matches.add("/App.js");
   }
-  if (STYLE_HINTS.test(prompt) && list.includes("/styles.css")) {
+  if (STYLE_HINTS.test(prompt) && safeList.includes("/styles.css")) {
     matches.add("/styles.css");
   }
 

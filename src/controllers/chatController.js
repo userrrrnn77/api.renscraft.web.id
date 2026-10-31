@@ -8,14 +8,17 @@ import {
   hashContent,
   newFileDrafts,
 } from "../services/diff.js";
-import { repairRevisionEntries } from "../services/contract/revisionCheck.js";
+import {
+  repairRevisionEntries,
+  deriveContract,
+} from "../services/contract/revisionCheck.js";
 import { decodeWhitespaceEntities } from "../services/contentNormalizer.js";
 import { extractUrls } from "../services/webReference.js";
 import { serializeProject } from "./projectController.js";
 import { resolveScope } from "../services/revisionScope.js";
 import {
-  buildAllowlist,
   findInventedFacts,
+  findVagueClaims,
 } from "../services/contract/factGuard.js";
 import {
   chargeCredits,
@@ -32,6 +35,10 @@ import {
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { fail } from "../utils/apiError.js";
 import { ensureUnsplashCredits } from "../services/stockImages.js";
+import { saveProjectVersion } from "../services/projectVersions.js";
+import { buildFactContext } from "../services/contract/factContext.js";
+import { runQualityGate } from "../services/qa/qualityGate.js";
+import { buildQualityReport } from "../services/quality.js";
 
 const MAX_PROMPT_LENGTH = 4000;
 
@@ -47,20 +54,15 @@ export const buildManifest = (files) => {
   return manifest;
 };
 
-// A2: history filter. The current prompt is already the last message, so it
-// is dropped from `recentMessages`, and so is the "Created file …" chatter
-// that floods the project's messages array during generation.
 const NOISE_RE =
   /^(Created file |Planning project|Planned website structure|Website generation complete)/;
 
 const chatHandler = async (req, res) => {
   const prompt =
     typeof req.body?.prompt === "string" ? req.body.prompt.trim() : "";
-
   if (!prompt) {
     return fail(res, 400, "CHAT_PROMPT_REQUIRED", {}, "prompt is required");
   }
-
   if (prompt.length > MAX_PROMPT_LENGTH) {
     return fail(
       res,
@@ -88,7 +90,6 @@ const chatHandler = async (req, res) => {
   const project = await Project.acquireLock(id, owner, "revising", {
     creditsHeld: cost,
   });
-
   if (!project) {
     await refundCredits(owner, cost);
     const exists = await Project.exists({ _id: id, owner });
@@ -124,14 +125,19 @@ const chatHandler = async (req, res) => {
     }
     if (healed) project.markModified("files");
 
+    // Snapshot "before" untuk derive contract + gate
+    const beforeFiles = Object.fromEntries(
+      Object.entries(project.files || {}).map(([p, e]) => [
+        p,
+        e?.content ?? "",
+      ]),
+    );
+
     const AI_HIDDEN = new Set(["/public/index.html"]);
     const manifest = buildManifest(project.files).filter(
       (f) => !AI_HIDDEN.has(f.path),
     );
 
-    // C2: revision scope. If the prompt names specific files/sections, only
-    // those go in `relevantFiles`; the rest stay in the manifest only.
-    // HARNESS_REVISION_SCOPE=0 disables the narrowing (mode "all").
     const allPaths = Object.keys(project.files || {}).filter(
       (p) => !AI_HIDDEN.has(p),
     );
@@ -155,8 +161,6 @@ const chatHandler = async (req, res) => {
       relevantFiles[path] = entry?.content ?? "";
     }
 
-    // A2: clean history — current prompt excluded, chatter excluded, capped
-    // at the last 4 messages, each message at most 500 chars.
     const recentMessages = (project.messages ?? [])
       .slice(0, -1)
       .filter((m) => !NOISE_RE.test(m.content))
@@ -174,8 +178,6 @@ const chatHandler = async (req, res) => {
         .join("\n"),
     );
 
-    // A5.5: project.brief may be a Mongoose subdocument. Convert it to a plain
-    // object so buildBriefBlock sees a stable shape.
     const briefSnapshot = project.brief?.toObject?.() ?? project.brief ?? null;
 
     const result = await reviseProject(
@@ -191,6 +193,19 @@ const chatHandler = async (req, res) => {
         scope,
       },
     );
+
+    const SERVER_OWNED = new Set(["/lib/renscraft.js"]);
+    const droppedSdk = result.operations.filter((op) =>
+      SERVER_OWNED.has(op.path),
+    );
+    if (droppedSdk.length > 0) {
+      console.warn(
+        `[Revision] dropped ${droppedSdk.length} op(s) on server-owned paths: ${droppedSdk.map((o) => `${o.op} ${o.path}`).join(", ")}`,
+      );
+      result.operations = result.operations.filter(
+        (op) => !SERVER_OWNED.has(op.path),
+      );
+    }
 
     console.log(
       `[AI] Got ${result.operations.length} operations: ${result.description}`,
@@ -249,13 +264,13 @@ const chatHandler = async (req, res) => {
 
     const zeroOperations = (result.operations || []).length === 0;
     const nothingApplied = applied.length === 0;
+
     if (zeroOperations || nothingApplied) {
       markUsageFailed(
         new Error(zeroOperations ? "zero operations" : "no operations applied"),
       );
     }
 
-    // Unsplash credits: dipasang server, bukan LLM.
     if (!nothingApplied && result.stockAssets?.length) {
       const plain = Object.fromEntries(
         Object.entries(updatedFiles).map(([p, f]) => [p, f?.content ?? ""]),
@@ -303,87 +318,261 @@ const chatHandler = async (req, res) => {
       }
     }
 
-    if (!nothingApplied) {
-      project.files = finalFiles;
-      project.markModified("files");
-      project.version += 1;
-      project.creditsHeld = 0;
+    // ── F6.1: QA gate untuk revisi ──────────────────────────────────────
+    // Static + Bundle; Render opsional via REVISION_QA_RENDER.
+    // Blocking issue di mode "enforce" append ke `errors` → atomic abort.
+    let revisionGateMode = "off";
+    let revisionGateIssues = [];
+    let revisionGateStages = {};
+    if (process.env.HARNESS_QA_GATE !== "0" && !nothingApplied) {
+      try {
+        const contract = deriveContract(beforeFiles);
+        const finalFilesPlain = Object.fromEntries(
+          Object.entries(finalFiles).map(([p, e]) => [
+            p,
+            typeof e === "string" ? e : (e?.content ?? ""),
+          ]),
+        );
+        const gate = await runQualityGate(finalFilesPlain, contract);
+        revisionGateMode = gate.mode;
+        revisionGateStages = gate.stages || {};
+        revisionGateIssues = gate.reportable ? gate.issues : [];
+
+        const fmt = (i) =>
+          `${i.code}${i.path ? ` @ ${i.path}` : ""}: ${i.message}`;
+
+        if (gate.mode === "enforce") {
+          const blocking = gate.issues.filter((i) => i.severity === "blocking");
+          if (blocking.length > 0) {
+            console.log(
+              `[QA] revision: ${blocking.length} blocking issue(s):\n  - ` +
+                blocking.map(fmt).join("\n  - "),
+            );
+            errors = errors.concat(
+              blocking.map((i) => `QA ${i.code}: ${i.message}`.slice(0, 200)),
+            );
+          } else if (gate.issues.length > 0) {
+            console.log(
+              `[QA] revision: passed with ${gate.issues.length} warning(s)`,
+            );
+          } else {
+            console.log(`[QA] revision: passed`);
+          }
+        } else if (gate.mode === "shadow" && gate.loggable?.length > 0) {
+          console.log(
+            `[QA] revision shadow: ${gate.loggable.length} blocking issue(s) (not applied):\n  - ` +
+              gate.loggable.map(fmt).join("\n  - "),
+          );
+        } else if (gate.mode !== "off" && gate.issues.length === 0) {
+          console.log(`[QA] revision ${gate.mode}: passed`);
+        }
+      } catch (err) {
+        console.warn(
+          `[QA] revision gate crashed (not blocking): ${err.message}`,
+        );
+      }
     }
 
-    // C1 log-only for revisions: after applyOperations, scan the touched files
-    // against the brief + concept + revision prompt allowlist. Never blocks.
-    // HARNESS_FACT_GUARD=0 disables it.
+    // ── F6: atomic decision ─────────────────────────────────────────────
+    const atomicMode = process.env.HARNESS_REVISION_ATOMIC !== "0";
+    const atomicAbort = atomicMode && !nothingApplied && errors.length > 0;
+    const shouldCommit = !nothingApplied && !atomicAbort;
+
+    // ── Files yang benar-benar tersentuh revisi ini ─────────────────────
+    // Dipakai oleh Fact Guard (C1) dan vague-claims check (F7) di bawah.
+    // HARUS di scope luar (bukan di dalam try) supaya dua blok try bisa
+    // mengaksesnya tanpa ReferenceError.
+    const touchedPaths = new Set();
+    for (const op of result.operations || []) {
+      if (op.path) touchedPaths.add(op.path);
+    }
+    for (const a of applied) {
+      const m = a.match(/(?:created|updated|deleted|rewrote) (\S+)/);
+      if (m) touchedPaths.add(m[1]);
+    }
+
+    if (shouldCommit) {
+      const newVersion = project.version + 1;
+      await saveProjectVersion({
+        projectId: project._id,
+        version: newVersion,
+        files: finalFiles,
+        prompt,
+        quality: project.quality ?? null,
+      }).catch((err) =>
+        console.error("[Version] save failed, continuing:", err),
+      );
+
+      project.files = finalFiles;
+      project.markModified("files");
+      project.version = newVersion;
+      project.creditsHeld = 0;
+
+      // F5.8: simpan hasil gate revisi ke QualityReport
+      if (revisionGateMode !== "off") {
+        project.quality = buildQualityReport(
+          revisionGateIssues.map((i) => ({
+            code: i.code,
+            severity: i.severity,
+            stage: i.stage || "static",
+            path: i.path,
+            message: i.message,
+            autoFixed: false,
+          })),
+          { stages: revisionGateStages, version: newVersion },
+        );
+        project.markModified("quality");
+      }
+    } else if (atomicAbort) {
+      console.log(
+        `[Revision:atomic] aborted — ${errors.length} error(s), candidate discarded`,
+      );
+    }
+
+    // C1: fact guard log-only (existing behaviour)
     if (
       process.env.HARNESS_FACT_GUARD !== "0" &&
-      briefSnapshot &&
-      !nothingApplied
+      shouldCommit &&
+      process.env.HARNESS_FACT_GUARD_REVISION !== "0"
     ) {
       try {
-        const sources = [
-          String(project.description ?? ""),
-          String(prompt ?? ""),
-          String(result.referenceContext ?? ""),
-        ];
-        const answers = briefSnapshot?.answers ?? {};
-        const slots = Array.isArray(briefSnapshot?.slots)
-          ? briefSnapshot.slots
-          : [];
-        for (const slot of slots) {
-          const v = answers[slot.key]?.value;
-          if (typeof v === "string" && v.trim()) sources.push(v);
-          if (typeof slot.placeholder === "string" && slot.placeholder.trim()) {
-            sources.push(slot.placeholder);
-          }
-        }
-        const allow = buildAllowlist(sources);
-        const touchedPaths = new Set();
-        for (const op of result.operations || []) {
-          if (op.path) touchedPaths.add(op.path);
-        }
-        for (const a of applied) {
-          const m = a.match(/(?:created|updated|deleted|rewrote) (\S+)/);
-          if (m) touchedPaths.add(m[1]);
-        }
-        let warned = 0;
+        const userMessages = (project.messages ?? [])
+          .filter((m) => m.role === "user")
+          .map((m) => ({ role: m.role, content: m.content }));
+
+        const factCtx = buildFactContext({
+          prompt: String(project.description ?? ""),
+          brief: briefSnapshot,
+          revisionPrompt: prompt,
+          userMessages,
+        });
+        const allow = factCtx.allow;
+
+        const blockingKinds = new Set([
+          "phone",
+          "email",
+          "price",
+          "stat",
+          "rating",
+          "year",
+        ]);
+        const MAX_FACT_REGEN = 2;
+
+        const scored = [];
         for (const p of touchedPaths) {
-          const code = project.files?.[p]?.content;
+          const code = finalFiles[p]?.content ?? finalFiles[p];
           if (typeof code !== "string") continue;
+          if (!/\.(jsx?)$/i.test(p)) continue;
           const facts = findInventedFacts(code, allow);
-          if (facts.length > 0) {
-            warned++;
-            console.warn(
-              `[FactGuard] revision ${p}: ${facts.length} potential invented fact(s): ${JSON.stringify(
-                facts.map((f) => ({
-                  kind: f.kind,
-                  value: f.value,
-                  line: f.line,
-                })),
-              )}`,
-            );
-          }
+          const blocking = facts.filter((f) => blockingKinds.has(f.kind));
+          if (blocking.length === 0) continue;
+          scored.push({ path: p, blocking });
         }
-        if (warned === 0) {
+
+        if (scored.length === 0) {
           console.log(
-            `[FactGuard] revision: no potential invented facts in touched files`,
+            `[FactGuard] revision: no invented facts in touched files`,
           );
+        } else {
+          scored.sort((a, b) => b.blocking.length - a.blocking.length);
+          const toFix = scored.slice(0, MAX_FACT_REGEN);
+          console.log(
+            `[FactGuard] revision: ${scored.length} file(s) with blocking facts, regen ${toFix.length}`,
+          );
+
+          for (const entry of toFix) {
+            const p = entry.path;
+            const before = finalFiles[p]?.content ?? finalFiles[p];
+            if (typeof before !== "string") continue;
+            const values = entry.blocking.map((f) => f.value);
+            try {
+              const newCode = await rewriteFile({
+                path: p,
+                current: before,
+                prompt:
+                  `The revision introduced invented facts: ${JSON.stringify(values)}. ` +
+                  `Rewrite this file removing those invented values. ` +
+                  `Only use facts that appear in the brief, the original prompt, or the user's message. ` +
+                  `Where data is missing, use the placeholder from the brief.`,
+                description: result.description,
+                allPaths: [...new Set([...Object.keys(finalFiles), p])],
+                assets: result.assets ?? [],
+                referenceContext: result.referenceContext ?? "",
+                briefBlock: result.briefBlock ?? "",
+                draft: false,
+              });
+              const afterFacts = findInventedFacts(newCode, allow);
+              const afterCount = afterFacts.filter((f) =>
+                blockingKinds.has(f.kind),
+              ).length;
+              if (afterCount < entry.blocking.length) {
+                finalFiles[p] = {
+                  content: newCode,
+                  hash: hashContent(newCode),
+                };
+                console.log(
+                  `[FactGuard] revision ${p}: ${entry.blocking.length} -> ${afterCount} blocking fact(s)`,
+                );
+              } else {
+                console.log(
+                  `[FactGuard] revision ${p}: regen did not improve, keeping current`,
+                );
+              }
+            } catch (err) {
+              console.warn(
+                `[FactGuard] revision ${p}: regen failed (${err.message}), keeping current`,
+              );
+            }
+          }
         }
       } catch (err) {
         console.warn(`[FactGuard] revision check failed: ${err.message}`);
       }
     }
 
+    // F7: vague claims → warning. Nggak blocking.
+    if (
+      process.env.HARNESS_FACT_GUARD !== "0" &&
+      process.env.HARNESS_FACT_GUARD_REVISION !== "0"
+    ) {
+      try {
+        const vagueWarnings = [];
+        for (const p of touchedPaths) {
+          const code = finalFiles[p]?.content ?? finalFiles[p];
+          if (typeof code !== "string") continue;
+          if (!/\.(jsx?)$/i.test(p)) continue;
+          const claims = findVagueClaims(code);
+          for (const c of claims) vagueWarnings.push({ path: p, ...c });
+        }
+        if (vagueWarnings.length > 0) {
+          console.warn(
+            `[FactGuard] revision: ${vagueWarnings.length} vague claim(s): ` +
+              vagueWarnings
+                .slice(0, 5)
+                .map((v) => `${v.path}:${v.line} "${v.value}"`)
+                .join("; "),
+          );
+        }
+      } catch (err) {
+        console.warn(`[FactGuard] vague claim check failed: ${err.message}`);
+      }
+    }
+
     project.status = "completed";
     project.error = null;
-    project.errorCode =
-      zeroOperations || nothingApplied ? "REVISION_NO_CHANGE" : null;
+    project.errorCode = zeroOperations
+      ? "REVISION_NO_CHANGE"
+      : atomicAbort
+        ? "REVISION_ABORTED"
+        : nothingApplied
+          ? "REVISION_NO_CHANGE"
+          : null;
 
-    // B3: distinguish "the model returned zero operations" from "operations
-    // existed but none could be applied".
     let assistantMessage;
     if (zeroOperations) {
-      assistantMessage = `AI tidak menghasilkan perubahan: ${
-        result.description || "tidak ada perubahan yang bisa diterapkan"
-      }`;
+      assistantMessage = `AI tidak menghasilkan perubahan: ${result.description || "tidak ada perubahan yang bisa diterapkan"}`;
+    } else if (atomicAbort) {
+      assistantMessage = `Revisi dibatalkan karena ${errors.length} masalah (operasi gagal dan/atau QA gate). Versi project tidak berubah, kredit sudah dikembalikan. Coba lagi dengan permintaan yang lebih spesifik.`;
     } else if (nothingApplied) {
       assistantMessage =
         "Perubahan belum berhasil diterapkan (AI salah menunjuk bagian kode). Coba kirim ulang permintaannya, atau sebutkan bagian yang mau diubah lebih spesifik.";
@@ -402,8 +591,18 @@ const chatHandler = async (req, res) => {
 
     await project.save();
 
-    const refunded =
-      zeroOperations || nothingApplied ? await refundHeld(project._id) : 0;
+    const refunded = !shouldCommit ? await refundHeld(project._id) : 0;
+
+    if (atomicAbort) {
+      return res.status(409).json({
+        error: assistantMessage,
+        code: "REVISION_ABORTED",
+        params: { failedOps: errors.length },
+        credits: await getBalance(owner),
+        refunded,
+        ...serializeProject(project),
+      });
+    }
 
     res.json({
       ...serializeProject(project),
@@ -417,7 +616,6 @@ const chatHandler = async (req, res) => {
   } catch (err) {
     markUsageFailed(err);
     console.error(`[AI Revision Error] ${err.message}`);
-
     try {
       await Project.updateOne(
         { _id: project._id },
@@ -428,9 +626,7 @@ const chatHandler = async (req, res) => {
         `[AI Revision Error] could not release project ${project._id}: ${releaseErr.message}`,
       );
     }
-
     const refunded = await refundHeld(project._id);
-
     res.status(500).json({
       error: err.message || "Failed to process revision request",
       code: "CHAT_FAILED",

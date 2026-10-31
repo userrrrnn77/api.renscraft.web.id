@@ -1,0 +1,35 @@
+{
+  "sha": "00f03bb",
+  "ts": "2026-10-31T16:28:25.071Z",
+  "results": [
+    {
+      "case": "eval/cases/revision.mjs",
+      "ok": true,
+      "ms": 369871,
+      "initialFileCount": 8,
+      "initialHasApp": true,
+      "opCount": 8,
+      "opPaths": [
+        "/components/Hero.js",
+        "/components/Hero.js",
+        "/components/Hero.js",
+        "/components/Hero.js",
+        "/components/Hero.js",
+        "/components/Hero.js",
+        "/components/Hero.js",
+        "/components/Hero.js"
+      ],
+      "budgetExceeded": false,
+      "budget": {
+        "mode": "log",
+        "exceeded": false,
+        "calls": 11,
+        "maxCalls": 40,
+        "inputTokens": 85688,
+        "maxInputTokens": 200000,
+        "outputTokens": 27304,
+        "maxOutputTokens": 100000
+      }
+    }
+  ]
+}

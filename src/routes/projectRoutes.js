@@ -10,6 +10,13 @@ import {
   publishProject,
   updateProjectFiles,
   uploadProjectImage,
+  claimSubdomain,
+  renewSubdomain,
+  releaseSubdomain,
+  getPublicProjectBySubdomain,
+  exportProject,
+  listProjectVersions,
+  restoreProjectVersion,
 } from "../controllers/projectController.js";
 import { authMiddleware } from "../middleware/authMiddleware.js";
 import { chat } from "../controllers/chatController.js";
@@ -19,6 +26,7 @@ const projectRouter = Router();
 // Public Route
 projectRouter.get("/public/:name", getPublicProject);
 projectRouter.get("/public", getAllPublicProjects);
+projectRouter.get("/public/subdomain/:slug", getPublicProjectBySubdomain);
 
 // Protect all following routes
 projectRouter.use(authMiddleware);
@@ -30,9 +38,17 @@ projectRouter.delete("/:id", deleteProject);
 projectRouter.put("/:id/files", updateProjectFiles);
 projectRouter.post("/:id/publish", publishProject);
 
-// Image upload: raw body (bukan JSON) biar bisa nerima file binary.
-// Limit 6MB — controller yang validasi 5MB, buffer JSON parser default 3mb
-// nggak ngefek karena route ini nggak pake express.json().
+// Subdomain routes
+projectRouter.post("/:id/claim-subdomain", claimSubdomain);
+projectRouter.post("/:id/renew-subdomain", renewSubdomain);
+projectRouter.delete("/:id/subdomain", releaseSubdomain);
+
+// Export route
+projectRouter.post("/:id/export", exportProject);
+projectRouter.get("/:id/versions", listProjectVersions);
+projectRouter.post("/:id/versions/:v/restore", restoreProjectVersion);
+
+// Image upload
 projectRouter.post(
   "/:id/images",
   express.raw({ type: "image/*", limit: "6mb" }),

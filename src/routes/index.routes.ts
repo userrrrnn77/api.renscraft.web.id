@@ -6,6 +6,7 @@ import projectRouter from "./projectRoutes.js";
 import adminRouter from "./adminRoutes.js";
 import redeemRouter from "./redeemRoutes.js";
 import referralRouter from "./referralRoutes.js";
+import dynamicRouter from "./dynamicRoutes.js";
 
 const appRouter = Router();
 
@@ -16,5 +17,6 @@ appRouter.use("/payments", paymentRoutes);
 appRouter.use("/admin", adminRouter);
 appRouter.use("/redeem", redeemRouter);
 appRouter.use("/referral", referralRouter);
+appRouter.use("/dynamic", dynamicRouter);
 
 export default appRouter;

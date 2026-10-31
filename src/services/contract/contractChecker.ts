@@ -51,6 +51,7 @@ export interface ContractIssue {
   path: string;
   message: string;
   fixed: boolean;
+  severity: string;
 }
 
 export interface CheckResult {
@@ -84,11 +85,21 @@ const SUFFIXES = ["", ".js", ".jsx", ".ts", ".tsx", "/index.js", "/index.jsx"];
 const inScope = (ctx: Ctx, p: string): boolean =>
   ctx.scope === null || ctx.scope.has(p);
 
-function note(ctx: Ctx, p: string, message: string, fixed: boolean): void {
-  ctx.issues.push({ path: p, message, fixed });
+function note(
+  ctx: Ctx,
+  p: string,
+  message: string,
+  fixed: boolean,
+  severity = "blocking",
+): void {
+  ctx.issues.push({ path: p, message, fixed, severity });
 }
 
-function resolveImport(from: string, spec: string, paths: Set<string>): string | null {
+function resolveImport(
+  from: string,
+  spec: string,
+  paths: Set<string>,
+): string | null {
   if (!spec.startsWith(".")) return null;
   const base = path.posix.resolve(path.posix.dirname(from), spec);
   for (const s of SUFFIXES) if (paths.has(base + s)) return base + s;
@@ -100,7 +111,9 @@ const importedName = (spec: t.ImportSpecifier): string =>
 
 const jsFiles = (ctx: Ctx): string[] => Object.keys(ctx.files).filter(isJs);
 
-const stringValue = (node: t.Node | null | undefined): t.StringLiteral | null => {
+const stringValue = (
+  node: t.Node | null | undefined,
+): t.StringLiteral | null => {
   if (!node) return null;
   if (t.isStringLiteral(node)) return node;
   if (t.isJSXExpressionContainer(node) && t.isStringLiteral(node.expression)) {
@@ -113,7 +126,8 @@ const stringValue = (node: t.Node | null | undefined): t.StringLiteral | null =>
 
 type ThemeName = (typeof THEME_EXPORTS)[number];
 const THEME_NAMES: readonly ThemeName[] = THEME_EXPORTS;
-const isThemeName = (n: string): n is ThemeName => (THEME_NAMES as readonly string[]).includes(n);
+const isThemeName = (n: string): n is ThemeName =>
+  (THEME_NAMES as readonly string[]).includes(n);
 
 function mapThemeExport(name: string): ThemeName | null {
   if (/^use/i.test(name)) return "useTheme";
@@ -142,7 +156,10 @@ function isThemeHookCall(node: t.Node): boolean {
 // `const a = 1, ThemeContext = ...;` and `export const ...` both declare variables
 function variableDeclarationOf(stmt: t.Node): t.VariableDeclaration | null {
   if (t.isVariableDeclaration(stmt)) return stmt;
-  if (t.isExportNamedDeclaration(stmt) && t.isVariableDeclaration(stmt.declaration)) {
+  if (
+    t.isExportNamedDeclaration(stmt) &&
+    t.isVariableDeclaration(stmt.declaration)
+  ) {
     return stmt.declaration;
   }
   return null;
@@ -164,7 +181,8 @@ function declarationsWithout(
     const r = range(d);
     text += code.slice(r.start, r.end);
     const next = decls[decls.indexOf(d) + 1];
-    if (d !== kept[kept.length - 1] && next) text += code.slice(r.end, range(next).start);
+    if (d !== kept[kept.length - 1] && next)
+      text += code.slice(r.end, range(next).start);
   }
   return { start: range(first).start, end: range(last).end, text };
 }
@@ -196,16 +214,27 @@ function themePass(ctx: Ctx): void {
       const stmt = info.decls.get(name);
       if (!stmt) continue;
       if (t.isExportDefaultDeclaration(stmt)) {
-        note(ctx, p, `defines its own default-exported ${name}; could not replace it with ${themePath}`, false);
+        note(
+          ctx,
+          p,
+          `defines its own default-exported ${name}; could not replace it with ${themePath}`,
+          false,
+          "warning",
+        );
         continue;
       }
 
       const vd = variableDeclarationOf(stmt);
       if (vd) {
         // only this variable goes, not the others declared in the same `const`
-        const declarator = vd.declarations.find((d) => t.isIdentifier(d.id, { name }));
+        const declarator = vd.declarations.find((d) =>
+          t.isIdentifier(d.id, { name }),
+        );
         if (!declarator) continue;
-        const entry = partial.get(vd) ?? { stmt, gone: new Set<t.VariableDeclarator>() };
+        const entry = partial.get(vd) ?? {
+          stmt,
+          gone: new Set<t.VariableDeclarator>(),
+        };
         entry.gone.add(declarator);
         partial.set(vd, entry);
         removedNodes.add(declarator);
@@ -242,12 +271,18 @@ function themePass(ctx: Ctx): void {
       if (
         target !== themePath &&
         imp.specifiers.length > 0 &&
-        imp.specifiers.every((s) => t.isImportSpecifier(s) && isThemeName(importedName(s))) &&
+        imp.specifiers.every(
+          (s) => t.isImportSpecifier(s) && isThemeName(importedName(s)),
+        ) &&
         (target !== null || /theme/i.test(imp.source.value))
       ) {
         const r = range(imp.source);
         const quote = code.charAt(r.start) || "'";
-        edits.push({ start: r.start, end: r.end, text: `${quote}${themeRel(p)}${quote}` });
+        edits.push({
+          start: r.start,
+          end: r.end,
+          text: `${quote}${themeRel(p)}${quote}`,
+        });
         messages.push(`theme import from ${imp.source.value} -> ${themePath}`);
         continue;
       }
@@ -260,7 +295,11 @@ function themePass(ctx: Ctx): void {
           const mapped = mapThemeExport(local);
           if (mapped && mapped !== "ThemeProvider") {
             const r = range(spec);
-            edits.push({ start: r.start, end: r.end, text: `{ ${mapped}${local === mapped ? "" : ` as ${local}`} }` });
+            edits.push({
+              start: r.start,
+              end: r.end,
+              text: `{ ${mapped}${local === mapped ? "" : ` as ${local}`} }`,
+            });
             messages.push(`default import ${local} -> { ${mapped} }`);
           }
         } else if (t.isImportSpecifier(spec)) {
@@ -270,10 +309,20 @@ function themePass(ctx: Ctx): void {
           const r = range(spec);
           if (mapped) {
             const local = spec.local.name;
-            edits.push({ start: r.start, end: r.end, text: local === mapped ? mapped : `${mapped} as ${local}` });
+            edits.push({
+              start: r.start,
+              end: r.end,
+              text: local === mapped ? mapped : `${mapped} as ${local}`,
+            });
             messages.push(`import ${name} -> ${mapped}`);
           } else {
-            note(ctx, p, `imports { ${name} } from the theme file, which only exports ${THEME_NAMES.join(", ")}`, false);
+            note(
+              ctx,
+              p,
+              `imports { ${name} } from the theme file, which only exports ${THEME_NAMES.join(", ")}`,
+              false,
+              "warning",
+            );
           }
         }
       }
@@ -297,7 +346,13 @@ function themePass(ctx: Ctx): void {
         if (!needed.includes("ThemeProvider")) needed.push("ThemeProvider");
         messages.push("wrapped App in <ThemeProvider>");
       } else {
-        note(ctx, p, "App does not render <ThemeProvider> and its returned JSX is not a plain element", false);
+        note(
+          ctx,
+          p,
+          "App does not render <ThemeProvider> and its returned JSX is not a plain element",
+          false,
+          "warning",
+        );
       }
     }
 
@@ -312,16 +367,31 @@ function themePass(ctx: Ctx): void {
         return;
       }
       for (const prop of node.id.properties) {
-        if (!t.isObjectProperty(prop) || prop.computed || !t.isIdentifier(prop.key)) continue;
+        if (
+          !t.isObjectProperty(prop) ||
+          prop.computed ||
+          !t.isIdentifier(prop.key)
+        )
+          continue;
         const key = prop.key.name;
         if ((THEME_VALUE_KEYS as readonly string[]).includes(key)) continue;
         const mapped = mapThemeKey(key);
         if (mapped && t.isIdentifier(prop.value)) {
           const r = range(prop);
-          edits.push({ start: r.start, end: r.end, text: `${mapped}: ${prop.value.name}` });
+          edits.push({
+            start: r.start,
+            end: r.end,
+            text: `${mapped}: ${prop.value.name}`,
+          });
           messages.push(`theme value ${key} -> ${mapped}`);
         } else {
-          note(ctx, p, `reads "${key}" from the theme, which only provides ${THEME_VALUE_KEYS.join(", ")}`, false);
+          note(
+            ctx,
+            p,
+            `reads "${key}" from the theme, which only provides ${THEME_VALUE_KEYS.join(", ")}`,
+            false,
+            "warning",
+          );
         }
       }
     });
@@ -358,8 +428,14 @@ interface Parsed {
   info: ModuleInfo;
 }
 
-function pickDefaultCandidate(info: ModuleInfo, filePath: string): string | null {
-  const base = path.posix.basename(filePath).replace(/\.[^.]+$/, "").toLowerCase();
+function pickDefaultCandidate(
+  info: ModuleInfo,
+  filePath: string,
+): string | null {
+  const base = path.posix
+    .basename(filePath)
+    .replace(/\.[^.]+$/, "")
+    .toLowerCase();
   const names = [...info.decls.keys()].filter((n) => /^[A-Z]/.test(n));
   const byName = names.find((n) => n.toLowerCase() === base);
   if (byName) return byName;
@@ -398,7 +474,15 @@ function exportPass(ctx: Ctx): void {
     if (!f || !stmt) return false;
     if (t.isExportNamedDeclaration(stmt)) return true;
     if (t.isExportDefaultDeclaration(stmt)) {
-      push(p, { start: f.code.length, end: f.code.length, text: `\nexport { ${name} };\n` }, `exported ${name}`);
+      push(
+        p,
+        {
+          start: f.code.length,
+          end: f.code.length,
+          text: `\nexport { ${name} };\n`,
+        },
+        `exported ${name}`,
+      );
     } else {
       const { start } = range(stmt);
       push(p, { start, end: start, text: "export " }, `exported ${name}`);
@@ -410,7 +494,15 @@ function exportPass(ctx: Ctx): void {
   const addDefaultExport = (p: string, name: string): void => {
     const f = parsed.get(p);
     if (!f) return;
-    push(p, { start: f.code.length, end: f.code.length, text: `\nexport default ${name};\n` }, `added default export ${name}`);
+    push(
+      p,
+      {
+        start: f.code.length,
+        end: f.code.length,
+        text: `\nexport default ${name};\n`,
+      },
+      `added default export ${name}`,
+    );
     added.add(`default@${p}`);
   };
 
@@ -419,19 +511,36 @@ function exportPass(ctx: Ctx): void {
     const f = parsed.get(fc.path);
     if (!f || fc.serverContent || !inScope(ctx, fc.path)) continue;
 
-    if (fc.defaultExport && !f.info.hasDefault && !added.has(`default@${fc.path}`)) {
+    if (
+      fc.defaultExport &&
+      !f.info.hasDefault &&
+      !added.has(`default@${fc.path}`)
+    ) {
       const name = f.info.decls.has(fc.defaultExport)
         ? fc.defaultExport
         : pickDefaultCandidate(f.info, fc.path);
       if (name) addDefaultExport(fc.path, name);
-      else note(ctx, fc.path, `has no default export (contract: ${fc.defaultExport})`, false);
+      else
+        note(
+          ctx,
+          fc.path,
+          `has no default export (contract: ${fc.defaultExport})`,
+          false,
+          "warning",
+        );
     }
 
     if (!f.info.exportsAll) {
       for (const name of fc.namedExports) {
         if (f.info.named.has(name) || added.has(`${name}@${fc.path}`)) continue;
         if (!addNamedExport(fc.path, name)) {
-          note(ctx, fc.path, `does not export ${name} (contract)`, false);
+          note(
+            ctx,
+            fc.path,
+            `does not export ${name} (contract)`,
+            false,
+            "warning",
+          );
         }
       }
     }
@@ -453,13 +562,27 @@ function exportPass(ctx: Ctx): void {
           if (tf.info.hasDefault || added.has(`default@${target}`)) continue;
           const name = pickDefaultCandidate(tf.info, target);
           if (name) addDefaultExport(target, name);
-          else note(ctx, from, `imports default from ${target}, which has no default export`, false);
+          else
+            note(
+              ctx,
+              from,
+              `imports default from ${target}, which has no default export`,
+              false,
+              "warning",
+            );
         } else if (t.isImportSpecifier(spec)) {
           const name = importedName(spec);
           if (name === "default" || tf.info.exportsAll) continue;
-          if (tf.info.named.has(name) || added.has(`${name}@${target}`)) continue;
+          if (tf.info.named.has(name) || added.has(`${name}@${target}`))
+            continue;
           if (!addNamedExport(target, name)) {
-            note(ctx, from, `imports { ${name} } from ${target}, which does not define it`, false);
+            note(
+              ctx,
+              from,
+              `imports { ${name} } from ${target}, which does not define it`,
+              false,
+              "warning",
+            );
           }
         }
       }
@@ -480,9 +603,27 @@ const HREF_KEYS = new Set(["href", "to", "link", "url", "path"]);
 const ANCHOR_RE = /^#[A-Za-z][\w-]*$/;
 const SYNONYMS: string[][] = [
   ["home", "hero", "beranda", "top", "banner", "welcome", "utama"],
-  ["about", "aboutus", "tentang", "tentangkami", "story", "ourstory", "whoweare"],
+  [
+    "about",
+    "aboutus",
+    "tentang",
+    "tentangkami",
+    "story",
+    "ourstory",
+    "whoweare",
+  ],
   ["menu", "menus", "ourmenu", "daftarmenu", "produk", "products"],
-  ["contact", "contactus", "kontak", "kontakkami", "hubungi", "location", "lokasi", "findus", "visit"],
+  [
+    "contact",
+    "contactus",
+    "kontak",
+    "kontakkami",
+    "hubungi",
+    "location",
+    "lokasi",
+    "findus",
+    "visit",
+  ],
   ["services", "service", "layanan", "features", "fitur"],
   ["gallery", "galeri", "portfolio", "photos"],
   ["testimonials", "testimonial", "testimoni", "reviews", "ulasan"],
@@ -504,7 +645,10 @@ function findAnchorMatch(target: string, ids: Set<string>): string | null {
 function collectIds(ast: t.File): Set<string> {
   const ids = new Set<string>();
   walk(ast.program, (node) => {
-    if (t.isJSXAttribute(node) && t.isJSXIdentifier(node.name, { name: "id" })) {
+    if (
+      t.isJSXAttribute(node) &&
+      t.isJSXIdentifier(node.name, { name: "id" })
+    ) {
       const lit = stringValue(node.value);
       if (lit) ids.add(lit.value);
       else if (
@@ -512,7 +656,11 @@ function collectIds(ast: t.File): Set<string> {
         t.isTemplateLiteral(node.value.expression) &&
         node.value.expression.expressions.length === 0
       ) {
-        ids.add(node.value.expression.quasis.map((q) => q.value.cooked ?? "").join(""));
+        ids.add(
+          node.value.expression.quasis
+            .map((q) => q.value.cooked ?? "")
+            .join(""),
+        );
       }
     }
   });
@@ -522,12 +670,24 @@ function collectIds(ast: t.File): Set<string> {
 function collectAnchorLinks(ast: t.File): t.StringLiteral[] {
   const out: t.StringLiteral[] = [];
   walk(ast.program, (node) => {
-    if (t.isJSXAttribute(node) && t.isJSXIdentifier(node.name, { name: "href" })) {
+    if (
+      t.isJSXAttribute(node) &&
+      t.isJSXIdentifier(node.name, { name: "href" })
+    ) {
       const lit = stringValue(node.value);
       if (lit && ANCHOR_RE.test(lit.value)) out.push(lit);
-    } else if (t.isObjectProperty(node) && !node.computed && t.isStringLiteral(node.value)) {
-      const key = t.isIdentifier(node.key) ? node.key.name : t.isStringLiteral(node.key) ? node.key.value : "";
-      if (HREF_KEYS.has(key) && ANCHOR_RE.test(node.value.value)) out.push(node.value);
+    } else if (
+      t.isObjectProperty(node) &&
+      !node.computed &&
+      t.isStringLiteral(node.value)
+    ) {
+      const key = t.isIdentifier(node.key)
+        ? node.key.name
+        : t.isStringLiteral(node.key)
+          ? node.key.value
+          : "";
+      if (HREF_KEYS.has(key) && ANCHOR_RE.test(node.value.value))
+        out.push(node.value);
     }
   });
   return out;
@@ -560,7 +720,8 @@ function scanAnchors(ctx: Ctx): AnchorScan {
       set.add(p);
       scan.owners.set(id, set);
     }
-    for (const lit of collectAnchorLinks(ast)) scan.linked.add(lit.value.slice(1));
+    for (const lit of collectAnchorLinks(ast))
+      scan.linked.add(lit.value.slice(1));
   }
   return scan;
 }
@@ -586,17 +747,31 @@ function anchorPass(ctx: Ctx): void {
 
     const root = rootOf(ast);
     if (!root) {
-      note(ctx, fc.path, `cannot add id='${want}': the returned JSX is not a plain element`, false);
+      note(
+        ctx,
+        fc.path,
+        `cannot add id='${want}': the returned JSX is not a plain element`,
+        false,
+        "warning",
+      );
       continue;
     }
 
     const attr = jsxAttribute(root, "id");
     const current = attr ? stringValue(attr.value) : null;
-    const taken = [...(first.owners.get(want) ?? [])].some((o) => o !== fc.path);
+    const taken = [...(first.owners.get(want) ?? [])].some(
+      (o) => o !== fc.path,
+    );
 
     if (attr) {
       if (!current) {
-        note(ctx, fc.path, `root id is not a plain string, cannot set it to '${want}'`, false);
+        note(
+          ctx,
+          fc.path,
+          `root id is not a plain string, cannot set it to '${want}'`,
+          false,
+          "warning",
+        );
       } else if (first.linked.has(current.value)) {
         // somebody links to it, so it was renamed on purpose (or the link is right)
         note(
@@ -604,29 +779,55 @@ function anchorPass(ctx: Ctx): void {
           fc.path,
           `root id is '${current.value}', the contract wants '${want}' (kept: #${current.value} is linked)`,
           false,
+          "warning",
         );
       } else if (taken) {
-        note(ctx, fc.path, `root id is '${current.value}', the contract wants '${want}' but another file already uses it`, false);
+        note(
+          ctx,
+          fc.path,
+          `root id is '${current.value}', the contract wants '${want}' but another file already uses it`,
+          false,
+          "warning",
+        );
       } else {
         // an id nobody links to: back to the contract id, so the links that do
         // exist (nav, footer) keep working
         const r = range(attr);
-        ctx.files[fc.path] = applyEdits(code, [{ start: r.start, end: r.end, text: `id='${want}'` }]);
+        ctx.files[fc.path] = applyEdits(code, [
+          { start: r.start, end: r.end, text: `id='${want}'` },
+        ]);
         note(ctx, fc.path, `root id '${current.value}' -> '${want}'`, true);
       }
       continue;
     }
 
     if (taken) {
-      note(ctx, fc.path, `cannot add id='${want}': another file already uses that id`, false);
+      note(
+        ctx,
+        fc.path,
+        `cannot add id='${want}': another file already uses that id`,
+        false,
+        "warning",
+      );
       continue;
     }
-    if (!t.isJSXIdentifier(root.openingElement.name) || !/^[a-z]/.test(root.openingElement.name.name)) {
-      note(ctx, fc.path, `cannot add id='${want}': the root is a component, not a plain element`, false);
+    if (
+      !t.isJSXIdentifier(root.openingElement.name) ||
+      !/^[a-z]/.test(root.openingElement.name.name)
+    ) {
+      note(
+        ctx,
+        fc.path,
+        `cannot add id='${want}': the root is a component, not a plain element`,
+        false,
+        "warning",
+      );
       continue;
     }
     const pos = range(root.openingElement.name).end;
-    ctx.files[fc.path] = applyEdits(code, [{ start: pos, end: pos, text: ` id='${want}'` }]);
+    ctx.files[fc.path] = applyEdits(code, [
+      { start: pos, end: pos, text: ` id='${want}'` },
+    ]);
     note(ctx, fc.path, `added id='${want}' to the root element`, true);
   }
 
@@ -644,10 +845,20 @@ function anchorPass(ctx: Ctx): void {
       const r = range(lit);
       if (match) {
         const quote = code.charAt(r.start) || "'";
-        edits.push({ start: r.start, end: r.end, text: `${quote}#${match}${quote}` });
+        edits.push({
+          start: r.start,
+          end: r.end,
+          text: `${quote}#${match}${quote}`,
+        });
         note(ctx, p, `link #${target} -> #${match}`, true);
       } else {
-        note(ctx, p, `link #${target} points to an id that does not exist`, false);
+        note(
+          ctx,
+          p,
+          `link #${target} points to an id that does not exist`,
+          false,
+          "warning",
+        );
       }
     }
     if (edits.length > 0) ctx.files[p] = applyEdits(code, edits);
@@ -673,7 +884,15 @@ const STYLE_TOKENS: Record<string, IconStyle> = {
   "fa-brands": "brands",
   fab: "brands",
 };
-const PRO_STYLES = new Set(["fa-light", "fa-thin", "fa-duotone", "fa-sharp", "fal", "fat", "fad"]);
+const PRO_STYLES = new Set([
+  "fa-light",
+  "fa-thin",
+  "fa-duotone",
+  "fa-sharp",
+  "fal",
+  "fat",
+  "fad",
+]);
 
 // own keys only: a class string can contain any word, "constructor" included
 const styleOf = (token: string): IconStyle | null =>
@@ -690,10 +909,20 @@ const ICON_ALIASES: Record<string, string> = {
   "tiktok-alt": "tiktok",
 };
 
-const STOP_WORDS = new Set(["fa", "icon", "alt", "outline", "solid", "regular", "brands"]);
+const STOP_WORDS = new Set([
+  "fa",
+  "icon",
+  "alt",
+  "outline",
+  "solid",
+  "regular",
+  "brands",
+]);
 
 function bestIcon(bad: string, family: Set<string>): string | null {
-  const words = bad.split("-").filter((w) => w.length > 1 && !STOP_WORDS.has(w));
+  const words = bad
+    .split("-")
+    .filter((w) => w.length > 1 && !STOP_WORDS.has(w));
   if (words.length === 0) return null;
   let best: string | null = null;
   let bestScore = 0;
@@ -702,7 +931,10 @@ function bestIcon(bad: string, family: Set<string>): string | null {
     let score = words.filter((w) => terms.includes(w)).length;
     if (score === 0) continue;
     if (name.split("-").some((n) => words.includes(n))) score += 0.5;
-    if (score > bestScore || (score === bestScore && best !== null && name.length < best.length)) {
+    if (
+      score > bestScore ||
+      (score === bestScore && best !== null && name.length < best.length)
+    ) {
       best = name;
       bestScore = score;
     }
@@ -723,7 +955,10 @@ interface IconFix {
 // a data object (`{ icon: 'fa-google-maps' }` rendered as `fa-brands ${x.icon}`).
 // The data string has no style token to switch, so the fix has to stay inside that
 // style: a brand icon becomes another brand icon, never a solid one.
-function fixIconClasses(value: string, forced: IconStyle | null = null): IconFix[] {
+function fixIconClasses(
+  value: string,
+  forced: IconStyle | null = null,
+): IconFix[] {
   const tokens = value.split(/\s+/).filter(Boolean);
   const fixes: IconFix[] = [];
 
@@ -736,16 +971,27 @@ function fixIconClasses(value: string, forced: IconStyle | null = null): IconFix
       styleToken = tk;
     } else if (PRO_STYLES.has(tk)) {
       // Pro styles are not in the free CDN build
-      fixes.push({ from: tk, to: "fa-solid", message: `${tk} is Font Awesome Pro -> fa-solid` });
+      fixes.push({
+        from: tk,
+        to: "fa-solid",
+        message: `${tk} is Font Awesome Pro -> fa-solid`,
+      });
       style = "solid";
     }
   }
-  if (!style && !(tokens.length === 1 && /^fa-[a-z0-9-]+$/.test(tokens[0] ?? ""))) return fixes;
+  if (
+    !style &&
+    !(tokens.length === 1 && /^fa-[a-z0-9-]+$/.test(tokens[0] ?? ""))
+  )
+    return fixes;
 
-  const iconToken = tokens.find((tk) => tk.startsWith("fa-") && !MODIFIER_RE.test(tk));
+  const iconToken = tokens.find(
+    (tk) => tk.startsWith("fa-") && !MODIFIER_RE.test(tk),
+  );
   if (!iconToken) return fixes;
   const name = iconToken.slice(3);
-  const family = style === "regular" ? REGULAR : style === "brands" ? BRANDS : SOLID;
+  const family =
+    style === "regular" ? REGULAR : style === "brands" ? BRANDS : SOLID;
   if (style ? family.has(name) : ANY_ICON.has(name)) return fixes;
 
   const strict = forced !== null && styleToken === null;
@@ -759,7 +1005,11 @@ function fixIconClasses(value: string, forced: IconStyle | null = null): IconFix
     ];
     for (const [s, set] of other) {
       if (s !== style && set.has(name)) {
-        fixes.push({ from: styleToken, to: `fa-${s}`, message: `fa-${name} is not in ${style}, switched to ${s}` });
+        fixes.push({
+          from: styleToken,
+          to: `fa-${s}`,
+          message: `fa-${name} is not in ${style}, switched to ${s}`,
+        });
         return fixes;
       }
     }
@@ -776,20 +1026,32 @@ function fixIconClasses(value: string, forced: IconStyle | null = null): IconFix
       });
       return fixes;
     }
-    const aliased = Object.hasOwn(ICON_ALIASES, name) ? ICON_ALIASES[name] : undefined;
+    const aliased = Object.hasOwn(ICON_ALIASES, name)
+      ? ICON_ALIASES[name]
+      : undefined;
     const candidate =
       (aliased && family.has(aliased) ? aliased : null) ??
       bestIcon(name, family) ??
       (style === "brands" ? null : "circle");
     fixes.push(
       candidate
-        ? { from: iconToken, to: `fa-${candidate}`, message: `unknown icon fa-${name} -> fa-${candidate} (${style})` }
-        : { from: iconToken, to: null, message: `unknown icon fa-${name}, no close match in fa-${style}` },
+        ? {
+            from: iconToken,
+            to: `fa-${candidate}`,
+            message: `unknown icon fa-${name} -> fa-${candidate} (${style})`,
+          }
+        : {
+            from: iconToken,
+            to: null,
+            message: `unknown icon fa-${name}, no close match in fa-${style}`,
+          },
     );
     return fixes;
   }
 
-  const aliased = Object.hasOwn(ICON_ALIASES, name) ? ICON_ALIASES[name] : undefined;
+  const aliased = Object.hasOwn(ICON_ALIASES, name)
+    ? ICON_ALIASES[name]
+    : undefined;
   const candidate =
     (aliased && ANY_ICON.has(aliased) ? aliased : null) ??
     bestIcon(name, style ? family : SOLID) ??
@@ -797,12 +1059,28 @@ function fixIconClasses(value: string, forced: IconStyle | null = null): IconFix
 
   if (candidate) {
     if (style === "brands" && !BRANDS.has(candidate) && styleToken) {
-      fixes.push({ from: styleToken, to: "fa-solid", message: `brand icon ${name} does not exist, using solid` });
+      fixes.push({
+        from: styleToken,
+        to: "fa-solid",
+        message: `brand icon ${name} does not exist, using solid`,
+      });
     }
-    fixes.push({ from: iconToken, to: `fa-${candidate}`, message: `unknown icon fa-${name} -> fa-${candidate}` });
+    fixes.push({
+      from: iconToken,
+      to: `fa-${candidate}`,
+      message: `unknown icon fa-${name} -> fa-${candidate}`,
+    });
   } else if (styleToken) {
-    fixes.push({ from: iconToken, to: "fa-link", message: `unknown icon fa-${name} -> fa-link` });
-    fixes.push({ from: styleToken, to: "fa-solid", message: "brand fallback uses solid" });
+    fixes.push({
+      from: iconToken,
+      to: "fa-link",
+      message: `unknown icon fa-${name} -> fa-link`,
+    });
+    fixes.push({
+      from: styleToken,
+      to: "fa-solid",
+      message: "brand fallback uses solid",
+    });
   }
   return fixes;
 }
@@ -814,7 +1092,14 @@ function fixIconClasses(value: string, forced: IconStyle | null = null): IconFix
 // render sites (in ANY file) and returns property name -> the styles it is
 // rendered with. A property rendered with one style only is "forced" to it.
 
-const CLASS_HELPERS = new Set(["clsx", "cn", "classNames", "classnames", "twMerge", "cx"]);
+const CLASS_HELPERS = new Set([
+  "clsx",
+  "cn",
+  "classNames",
+  "classnames",
+  "twMerge",
+  "cx",
+]);
 
 function flattenClass(node: t.Node): Array<string | t.Node> {
   if (t.isStringLiteral(node)) return [node.value];
@@ -830,7 +1115,11 @@ function flattenClass(node: t.Node): Array<string | t.Node> {
   if (t.isBinaryExpression(node, { operator: "+" })) {
     return [...flattenClass(node.left), ...flattenClass(node.right)];
   }
-  if (t.isCallExpression(node) && t.isIdentifier(node.callee) && CLASS_HELPERS.has(node.callee.name)) {
+  if (
+    t.isCallExpression(node) &&
+    t.isIdentifier(node.callee) &&
+    CLASS_HELPERS.has(node.callee.name)
+  ) {
     return node.arguments.flatMap((a) => flattenClass(a));
   }
   return [node];
@@ -847,14 +1136,18 @@ function propertyKeyOf(node: t.Node): string | null {
   return t.isIdentifier(node) ? node.name : null;
 }
 
-function collectIconStyles(parsed: Iterable<t.File>): Map<string, Set<IconStyle>> {
+function collectIconStyles(
+  parsed: Iterable<t.File>,
+): Map<string, Set<IconStyle>> {
   const result = new Map<string, Set<IconStyle>>();
   for (const ast of parsed) {
     walk(ast.program, (node) => {
       const isSite =
         t.isTemplateLiteral(node) ||
         t.isBinaryExpression(node, { operator: "+" }) ||
-        (t.isCallExpression(node) && t.isIdentifier(node.callee) && CLASS_HELPERS.has(node.callee.name));
+        (t.isCallExpression(node) &&
+          t.isIdentifier(node.callee) &&
+          CLASS_HELPERS.has(node.callee.name));
       if (!isSite) return;
 
       const pieces = flattenClass(node);
@@ -892,7 +1185,8 @@ function forcedStyleFor(
   value: string,
   iconStyles: Map<string, Set<IconStyle>>,
 ): IconStyle | null {
-  if (!t.isObjectProperty(parent) || parent.value !== node || parent.computed) return null;
+  if (!t.isObjectProperty(parent) || parent.value !== node || parent.computed)
+    return null;
   const key = t.isIdentifier(parent.key)
     ? parent.key.name
     : t.isStringLiteral(parent.key)
@@ -904,7 +1198,12 @@ function forcedStyleFor(
   // only a bare icon name: a string with its own style token decides for itself
   const tokens = value.split(/\s+/).filter(Boolean);
   if (tokens.length === 0) return null;
-  if (!tokens.every((tk) => tk.startsWith("fa-") && !styleOf(tk) && !PRO_STYLES.has(tk))) return null;
+  if (
+    !tokens.every(
+      (tk) => tk.startsWith("fa-") && !styleOf(tk) && !PRO_STYLES.has(tk),
+    )
+  )
+    return null;
   return [...styles][0] ?? null;
 }
 
@@ -924,19 +1223,31 @@ function iconPass(ctx: Ctx): void {
 
     const edits: Edit[] = [];
     const messages: string[] = [];
-    const consider = (node: t.Node, parent: t.Node | null, value: string): void => {
+    const consider = (
+      node: t.Node,
+      parent: t.Node | null,
+      value: string,
+    ): void => {
       if (!/(^|\s)fa-|(^|\s)(fas|far|fab)(\s|$)/.test(value)) return;
-      const fixes = fixIconClasses(value, forcedStyleFor(node, parent, value, iconStyles));
+      const fixes = fixIconClasses(
+        value,
+        forcedStyleFor(node, parent, value, iconStyles),
+      );
       if (fixes.length === 0) return;
 
-      const real = fixes.filter((f): f is IconFix & { to: string } => f.to !== null);
-      for (const f of fixes) if (f.to === null) note(ctx, p, f.message, false);
+      const real = fixes.filter(
+        (f): f is IconFix & { to: string } => f.to !== null,
+      );
+      for (const f of fixes)
+        if (f.to === null) note(ctx, p, f.message, false, "warning");
       if (real.length === 0) return;
 
       const r = range(node);
       let text = code.slice(r.start, r.end);
       for (const f of real) {
-        const re = new RegExp(`(?<![\\w-])${f.from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`);
+        const re = new RegExp(
+          `(?<![\\w-])${f.from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`,
+        );
         text = text.replace(re, f.to);
         messages.push(f.message);
       }
@@ -946,7 +1257,11 @@ function iconPass(ctx: Ctx): void {
     walk(ast.program, (node, parent) => {
       if (t.isStringLiteral(node)) consider(node, parent, node.value);
       else if (t.isTemplateLiteral(node) && node.expressions.length === 0) {
-        consider(node, parent, node.quasis.map((q) => q.value.cooked ?? "").join(""));
+        consider(
+          node,
+          parent,
+          node.quasis.map((q) => q.value.cooked ?? "").join(""),
+        );
       }
     });
 
@@ -973,7 +1288,7 @@ function factsPass(ctx: Ctx): void {
       ctx.files[p] = applyEdits(code, result.edits);
       for (const m of result.fixed) note(ctx, p, m, true);
     }
-    for (const m of result.open) note(ctx, p, m, false);
+    for (const m of result.open) note(ctx, p, m, false, "warning");
   }
 }
 
@@ -1019,7 +1334,13 @@ function runPass(ctx: Ctx, name: string, pass: Pass): void {
   } catch (err) {
     ctx.files = snapshot;
     revertClaims(ctx, mark, null, `${name} pass crashed`);
-    note(ctx, "*", `${name} pass crashed: ${err instanceof Error ? err.message : String(err)}`, false);
+    note(
+      ctx,
+      "*",
+      `${name} pass crashed: ${err instanceof Error ? err.message : String(err)}`,
+      false,
+      "warning",
+    );
     return;
   }
 
@@ -1035,7 +1356,13 @@ function runPass(ctx: Ctx, name: string, pass: Pass): void {
   if (broken.size > 0) {
     revertClaims(ctx, mark, broken, "the file no longer parses");
     for (const p of broken) {
-      note(ctx, p, `${name} pass: the file does not parse after the fix, change reverted`, false);
+      note(
+        ctx,
+        p,
+        `${name} pass: the file does not parse after the fix, change reverted`,
+        false,
+        "warning",
+      );
     }
   }
 }

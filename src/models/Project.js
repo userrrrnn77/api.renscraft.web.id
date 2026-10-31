@@ -5,15 +5,12 @@ import mongoose, { Schema } from "mongoose";
 export const BUSY_STATUSES = ["pending", "generating", "revising"];
 export const PROJECT_STATUSES = [...BUSY_STATUSES, "completed", "failed"];
 
-// Kode error yang bisa muncul di Project.errorCode. Client translate lewat
-// i18n key `projectErrors.<code>`. Sengaja dipisah dari `error` (teks bebas)
-// karena `error` disimpan sebagai history buat debug, sedangkan `errorCode`
-// yang ditampilkan ke user.
 export const PROJECT_ERROR_CODES = [
   "GENERATION_FAILED",
   "GENERATION_TIMEOUT",
   "REVISION_TIMEOUT",
   "REVISION_NO_CHANGE",
+  "REVISION_ABORTED",
   "NO_APP_JS",
 ];
 
@@ -34,6 +31,34 @@ const PlannedFileSchema = new Schema(
   { _id: false },
 );
 
+const QualityIssueSchema = new Schema(
+  {
+    code: String,
+    severity: { type: String, enum: ["blocking", "warning"] },
+    stage: String,
+    path: String,
+    message: String,
+    autoFixed: Boolean,
+  },
+  { _id: false },
+);
+
+const QualityReportSchema = new Schema(
+  {
+    status: {
+      type: String,
+      enum: ["pending", "passed", "passed_with_warnings", "failed"],
+      default: "pending",
+    },
+    issues: { type: [QualityIssueSchema], default: [] },
+    stages: { type: Schema.Types.Mixed, default: {} },
+    repairRounds: { type: Number, default: 0 },
+    checkedAt: Date,
+    version: Number,
+  },
+  { _id: false },
+);
+
 const ProjectSchema = new Schema(
   {
     name: { type: String, required: true, default: "Untitled Project" },
@@ -43,6 +68,20 @@ const ProjectSchema = new Schema(
     version: { type: Number, default: 0 },
     owner: { type: Schema.Types.ObjectId, ref: "User", required: true },
     published: { type: Boolean, default: false },
+
+    // ─── FITUR PREMIUM SUBDOMAIN ───
+    customSubdomain: {
+      type: String,
+      unique: true,
+      sparse: true,
+      trim: true,
+      lowercase: true,
+    },
+    subdomainExpiresAt: {
+      type: Date,
+      default: null,
+    },
+
     status: {
       type: String,
       enum: PROJECT_STATUSES,
@@ -51,14 +90,13 @@ const ProjectSchema = new Schema(
     filesPlanned: { type: [PlannedFileSchema], default: [] },
     filesGenerated: { type: [String], default: [] },
     currentFile: { type: String, default: null },
-    // Teks bebas buat debug/log. Jangan dipakai client buat ditampilkan —
-    // pakai errorCode.
     error: { type: String, default: null },
-    // Kode yang ditampilkan ke user (di-translate di client). Lihat
-    // PROJECT_ERROR_CODES di atas.
     errorCode: { type: String, default: null },
     creditsHeld: { type: Number, default: 0, min: 0 },
+    firstExportAt: { type: Date, default: null },
     brief: { type: Schema.Types.Mixed, default: null },
+    dataSpec: { type: Schema.Types.Mixed, default: null },
+    quality: { type: QualityReportSchema, default: null },
     uploadedImages: {
       type: [
         {
@@ -77,7 +115,6 @@ const ProjectSchema = new Schema(
 );
 
 ProjectSchema.index({ owner: 1, updatedAt: -1 });
-
 ProjectSchema.index(
   { name: 1 },
   {

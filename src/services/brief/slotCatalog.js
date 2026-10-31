@@ -360,7 +360,7 @@ export const CATEGORIES = [
     ],
   },
   {
-    // game, kalkulator, todo, timer: tidak butuh data dari user
+    // game, kalkulator, todo, timer: tidak butuh data dari user // yang ini bre***
     id: "app_tool",
     label: "Aplikasi / Game / Tool",
     hint: "game, kalkulator, todo app, timer, converter, quiz",

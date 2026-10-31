@@ -4,7 +4,12 @@ import path from "node:path";
 import { createOpenAI } from "@ai-sdk/openai";
 import { generateText } from "ai";
 import pMap from "p-map";
-import { recordUsage } from "./usageTracker.js";
+import {
+  recordUsage,
+  assertBudgetNow,
+  getBudgetSummary,
+} from "./usageTracker.js";
+import { getGlobalSemaphore } from "./semaphore.js";
 import {
   FilePlanSchema,
   RevisionResultSchema,
@@ -33,9 +38,12 @@ import { fixOffTopicImages } from "./imageGuard.js";
 import {
   applyContractToPlan,
   renderContractPrompt,
+  parseExports,
 } from "./contract/projectContract.js";
 import { checkContract } from "./contract/contractChecker.js";
 import { fixStylesheets } from "./contract/cssFix.js";
+import { finalizeProject } from "./finalize.js";
+import { runQualityGate } from "./qa/qualityGate.js";
 import { buildBriefBlock, mergeBriefFacts } from "./brief/briefContext.js";
 import { pruneSectionsWithoutData } from "./brief/planGuard.js";
 import { buildAllowlist, findInventedFacts } from "./contract/factGuard.js";
@@ -47,6 +55,7 @@ import {
   fetchItemPhotos,
   triggerDownloads,
 } from "./stockImages.js";
+import { buildFactContext } from "./contract/factContext.js";
 
 // Update juga AI_PRICE_IN_PER_M / AI_PRICE_OUT_PER_M biar tracker biaya akurat.
 const MODEL = process.env.AI_MODEL || "deepseek-v4.1-flash";
@@ -108,6 +117,19 @@ function logContext(label, info = {}) {
   console.log(`[Context] ${label} ${parts.join(" ")}`);
 }
 
+// F4: bungkus SEMUA panggilan LLM dengan semaphore global + cek budget.
+// Kalau assertBudgetNow throw (enforce mode), panggilan nggak pernah terjadi.
+async function withSlot(label, fn) {
+  const sem = getGlobalSemaphore();
+  const release = await sem.acquire();
+  try {
+    assertBudgetNow(label);
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
 // A2 / A5.1: precedence note, added only when a brief block exists.
 const REVISION_PRECEDENCE_NOTE =
   "The revision request below is the newest instruction. If it gives new data (phone, address, price, name, hours) use it, it replaces the brief value. If it asks for a section whose data is not in the brief, create it with skeleton placeholder cards following the brief placeholder rules, never invented names, prices, ratings, quotes or numbers, and say in description that the content is a placeholder. Style is different: the existing files show the current look, so keep that look unless the revision request asks to change it. If it does (colors, mood, dark or light, a different style), follow the request; the brief's Arahan gaya then no longer applies to the parts you change.";
@@ -150,13 +172,9 @@ export async function generateObjectTracked(label, args) {
     "JANGAN tulis teks apa pun di luar JSON. " +
     'Semua string pakai kutip ganda (") dan escape yang benar.';
 
-  // Kalau ini bukan percobaan terakhir dan error-nya 5xx/network, coba lagi
-  // dengan delay yang lebih panjang. SDK-nya udah retry sendiri, tapi base
-  // backoff-nya terlalu cepat buat provider yang lagi 502/503.
   const isRetryableUpstream = (err) => {
     const status = err?.statusCode ?? err?.response?.status;
     if (status >= 500 && status < 600) return true;
-    // Network errors (DNS, socket, timeout)
     if (err?.cause?.code === "ECONNRESET") return true;
     if (err?.cause?.code === "ETIMEDOUT") return true;
     if (
@@ -177,12 +195,15 @@ export async function generateObjectTracked(label, args) {
       : prompt;
 
     try {
-      const result = await generateText({
-        model,
-        system: system + JSON_RULE,
-        prompt: finalPrompt,
-        abortSignal,
-      });
+      const result = await withSlot(label, () =>
+        generateText({
+          model,
+          system: system + JSON_RULE,
+          prompt: finalPrompt,
+          abortSignal,
+        }),
+      );
+
       recordUsage(label, result.usage, modelName ?? null);
 
       try {
@@ -196,13 +217,11 @@ export async function generateObjectTracked(label, args) {
         if (attempt >= maxRetries) throw err;
       }
     } catch (err) {
-      // Beda dari JSON parse error — ini error dari HTTP layer.
-      // Coba lagi dengan delay lebih panjang kalau upstream 5xx.
       const retryable = isRetryableUpstream(err);
 
       if (!retryable || attempt >= maxRetries) throw err;
 
-      const delayMs = 3000 * Math.pow(2, attempt); // 3s, 6s, 12s
+      const delayMs = 3000 * Math.pow(2, attempt);
       console.warn(
         `[AI] ${label} attempt ${attempt + 1} upstream error (${err.statusCode || err.cause?.code || "network"}): ` +
           `${(err.message || String(err)).slice(0, 200)} — retrying in ${delayMs}ms`,
@@ -310,6 +329,7 @@ async function generateSingleFile(
   assets = [],
   contract = null,
   hasBrief = false,
+  dataSpec = null,
 ) {
   const system = buildFileCodeSystem(
     allFiles,
@@ -320,9 +340,26 @@ async function generateSingleFile(
 
   const plannedList = allFiles.map((f) => f.path).join(", ");
 
-  let userMsg = `Project: ${prompt}\n\nWrite the complete code for: ${file.path}\nPurpose: ${file.description}\n\nImport rule: the only local files that exist are: ${plannedList}. Never import any other local file (for example a per-component .css file). Style with Tailwind classes and the global /styles.css.\n\nReturn ONLY the raw source code of this file.`;
+  let dataSpecInstruction = "";
+  if (dataSpec && dataSpec.collections && dataSpec.collections.length > 0) {
+    const schemaRules = dataSpec.collections
+      .map((c) => {
+        const fieldKeys = c.fields.map((f) => f.key).join(", ");
+        return `- Collection "${c.name}": Use EXACTLY these field keys: [${fieldKeys}]`;
+      })
+      .join("\n");
 
-  // B1: retry feedback.
+    dataSpecInstruction = `\n\nIMPORTANT DATABASE RULES:
+When using \`db.collection(...).create(...)\` from '/lib/renscraft.js':
+1. Use EXACT collection names.
+2. Use EXACT field keys. Do NOT invent new keys. If the schema uses Indonesian (e.g., 'nama', 'pesan'), you MUST use that exact string in the payload object.
+Schema:
+${schemaRules}
+`;
+  }
+
+  let userMsg = `Project: ${prompt}\n\nWrite the complete code for: ${file.path}\nPurpose: ${file.description}\n\nImport rule: the only local files that exist are: ${plannedList}. Never import any other local file. Style with Tailwind classes and the global /styles.css.${dataSpecInstruction}\n\nReturn ONLY the raw source code of this file.`;
+
   if (RETRY_FEEDBACK && file.lastError) {
     const last = String(file.lastError).slice(0, 300);
     userMsg += `\n\nPrevious attempt was rejected: ${last}. Fix exactly that and keep everything else.`;
@@ -340,17 +377,20 @@ async function generateSingleFile(
   });
 
   console.log(`[AI] Creating file: ${file.path}...`);
-  const { text, finishReason, usage } = await generateText({
-    model,
-    system,
-    prompt: userMsg,
-    maxRetries: 2,
-    maxOutputTokens: MAX_OUTPUT_TOKENS,
-  });
-  // Recorded before any validation: rejected / cut-off files still cost tokens
+  const { text, finishReason, usage } = await withSlot(
+    `file ${file.path}`,
+    () =>
+      generateText({
+        model,
+        system,
+        prompt: userMsg,
+        maxRetries: 2,
+        maxOutputTokens: MAX_OUTPUT_TOKENS,
+      }),
+  );
+
   recordUsage(`file ${file.path}`, usage);
 
-  // A cut-off file is never valid code (unclosed brackets, missing exports...)
   if (finishReason === "length") {
     throw new Error(
       `Output for ${file.path} was cut off (hit ${MAX_OUTPUT_TOKENS} output tokens)`,
@@ -358,10 +398,8 @@ async function generateSingleFile(
   }
 
   let code = extractCode(text);
-  // ref-img-01 -> real image URL (the model only ever sees the short token)
   code = applyAssetTokens(code, assets);
-  // Foto stock yang ga nyambung sama bisnisnya (laptop di menu kopi, dst) ditukar.
-  // Dilewati kalau user ngasih gambar referensi sendiri.
+
   if (!assets.length) {
     const img = fixOffTopicImages(code, { prompt, filePath: file.path });
     code = img.code;
@@ -388,11 +426,9 @@ async function generateSingleFile(
     );
   }
 
-  // Apply post-generation validation and auto-fixing
   const validation = validateAndFixCode(code, file.path, {
     allPlannedFiles: allFiles,
   });
-
   code = validation.code;
 
   if (validation.warnings.length > 0) {
@@ -401,9 +437,6 @@ async function generateSingleFile(
     );
   }
 
-  // Relative imports must point to files that are in the plan, otherwise
-  // Sandpack fails with "Could not find module in path". Missing stylesheets
-  // are removed; any other missing file makes the retry loop regenerate.
   if (/\.(jsx?|tsx?)$/i.test(file.path)) {
     const importCheck = fixUnresolvedImports(
       code,
@@ -411,7 +444,6 @@ async function generateSingleFile(
       allFiles.map((f) => f.path),
     );
     code = importCheck.code;
-
     if (importCheck.warnings.length > 0) {
       console.log(
         `[ImportGuard] ${file.path}:\n  - ${importCheck.warnings.join("\n  - ")}`,
@@ -424,11 +456,8 @@ async function generateSingleFile(
     }
   }
 
-  // Final gate: never save code that Sandpack/Babel/PostCSS cannot parse.
-  // Throwing here makes the retry loop regenerate the file.
   const syntaxError = findSyntaxError(code, file.path);
   if (syntaxError) {
-    // Show the exact offending line, so the real cause is visible in the log
     const pos = /\((\d+):(\d+)\)/.exec(syntaxError);
     if (pos) {
       const badLine = code.split("\n")[Number(pos[1]) - 1] ?? "";
@@ -440,7 +469,6 @@ async function generateSingleFile(
       `Generated code for ${file.path} has a syntax error: ${syntaxError.slice(0, 200)}`,
     );
   }
-
   console.log(`[AI] Created file: ${file.path} (${code.length} chars)`);
   return { path: file.path, code };
 }
@@ -601,8 +629,6 @@ async function searchUnsplash(queries) {
   return results;
 }
 
-// ── PART 2/3 continues below with generateProject ───────────────────────────
-
 // ── PART 2/3: generateProject ──────────────────────────────────────────────
 
 // Generate project files: plan first, then build files in order with fallback retries
@@ -621,7 +647,6 @@ export async function generateProject(prompt, callbacks, options = {}) {
   const briefBlock = options.brief ? buildBriefBlock(options.brief) : "";
   const hasBrief = Boolean(options.brief);
 
-  // Context awal: cuma URL dari prompt + upload user. Dipakai buat plan.
   const initialRefs = await buildReferenceContext(prompt, [], {
     mirror: mirrorImages,
     extraAssets: uploadedAssets,
@@ -647,7 +672,7 @@ export async function generateProject(prompt, callbacks, options = {}) {
     }
   }
 
-  // Phase 1: Plan. C3: plan may use the fast model when AI_FAST_FOR_PLAN=1.
+  // Phase 1: Plan.
   logContext("plan", {
     layers: ["concept", "brief", "refs"],
     refs: initialRefs.assets.length,
@@ -665,7 +690,7 @@ export async function generateProject(prompt, callbacks, options = {}) {
     maxRetries: 2,
   });
 
-  // Phase 1.5: stock photos dari Unsplash (kalau planner ngerasa butuh).
+  // Phase 1.5: stock photos.
   let stockAssets = [];
   if (rawPlan.imageQueries?.length && process.env.UNSPLASH_ACCESS_KEY) {
     stockAssets = await searchUnsplash(rawPlan.imageQueries);
@@ -676,7 +701,7 @@ export async function generateProject(prompt, callbacks, options = {}) {
     }
   }
 
-  // Phase 1.6: kalau ada stock assets, rebuild context biar token-nya ke-include.
+  // Phase 1.6: rebuild context with stock assets.
   let referenceContext = initialRefs.context;
   let assets = initialRefs.assets;
   if (stockAssets.length > 0) {
@@ -714,7 +739,6 @@ export async function generateProject(prompt, callbacks, options = {}) {
     });
   }
 
-  // A4: drop sections with no data in the brief before the contract is fixed.
   let planInput = rawPlan;
   if (options.brief && process.env.HARNESS_PLAN_GUARD !== "0") {
     const { plan: pruned, dropped } = pruneSectionsWithoutData(
@@ -729,10 +753,8 @@ export async function generateProject(prompt, callbacks, options = {}) {
     planInput = pruned;
   }
 
-  // Phase 1b: contract. Everything that must be identical across files.
   const { plan, contract } = applyContractToPlan(planInput, prompt);
 
-  // Fakta dari planner itu karangan: ganti dengan yang berasal dari brief
   if (options.brief) {
     contract.facts = mergeBriefFacts(contract.facts, options.brief, prompt);
   }
@@ -741,14 +763,7 @@ export async function generateProject(prompt, callbacks, options = {}) {
     await callbacks.onPlan(plan);
   }
 
-  console.log(
-    `[AI] Phase 2: Generating ${plan.files.length} files in parallel (concurrency=${MAX_CONCURRENCY}): ${plan.files.map((f) => f.path).join(", ")}`,
-  );
-
   const files = {};
-
-  // B4: emitted map — every file passed to onFileComplete. Used at the end to
-  // compute `fixed` so nothing changed after onFileComplete is lost.
   const emitted = new Map();
   const normPath = (p) => (p.startsWith("/") ? p : "/" + p);
   const emitFile = async (path, code) => {
@@ -758,13 +773,10 @@ export async function generateProject(prompt, callbacks, options = {}) {
     }
   };
 
-  // B1: server-owned paths for the trimmed retry context.
   const serverOwnedPaths = contract.files
     .filter((fc) => fc.serverContent != null)
     .map((fc) => fc.path);
 
-  // Files the server writes itself (ThemeContext) go first, so every file
-  // generated afterwards sees their real source in its context.
   for (const fc of contract.files) {
     if (fc.serverContent == null) continue;
     if (callbacks?.onFileStart) await callbacks.onFileStart(fc.path);
@@ -776,11 +788,17 @@ export async function generateProject(prompt, callbacks, options = {}) {
     .filter((f) => !Object.hasOwn(files, f.path))
     .map((f) => ({ ...f }));
 
-  const maxRetryRounds = 2;
+  console.log(
+    `[AI] Phase 2: Generating ${plan.files.length} files in parallel (concurrency=${MAX_CONCURRENCY}): ${plan.files.map((f) => f.path).join(", ")}`,
+  );
 
+  const FATAL_CODES = new Set(["BUDGET_EXCEEDED", "SEMAPHORE_TIMEOUT"]);
+  let budgetExceeded = false;
+  let semaphoreTimedOut = false;
+
+  const maxRetryRounds = 2;
   for (let round = 0; round <= maxRetryRounds; round++) {
     if (pendingFiles.length === 0) break;
-
     if (round > 0) {
       console.log(
         `[AI] Retry round ${round}/${maxRetryRounds} for ${pendingFiles.length} failed files: ${pendingFiles.map((f) => f.path).join(", ")}`,
@@ -794,13 +812,10 @@ export async function generateProject(prompt, callbacks, options = {}) {
           if (callbacks?.onFileStart) {
             await callbacks.onFileStart(file.path);
           }
-
-          // B1: retry rounds get a trimmed context, not the whole project.
           const alreadyGenerated =
             round === 0 || !RETRY_FEEDBACK
               ? files
               : contextFilesFor(file, plan, files, serverOwnedPaths);
-
           const singleResult = await generateSingleFile(
             file,
             plan.files,
@@ -809,12 +824,11 @@ export async function generateProject(prompt, callbacks, options = {}) {
             assets,
             contract,
             hasBrief,
+            plan.dataSpec ?? null,
           );
-
           await emitFile(file.path, singleResult.code);
           return { success: true, file, result: singleResult };
         } catch (err) {
-          // B1: keep the error for the next retry.
           file.lastError = String(err?.message ?? err).slice(0, 300);
           return { success: false, file, error: err };
         }
@@ -824,10 +838,21 @@ export async function generateProject(prompt, callbacks, options = {}) {
 
     const failedFiles = [];
     for (const entry of results) {
+      if (!entry || typeof entry !== "object") {
+        console.warn(
+          `[AI] pMap produced an invalid entry (round ${round}), skipping`,
+        );
+        continue;
+      }
       if (entry.success) {
         const { path: p, code } = entry.result;
         files[p.startsWith("/") ? p : "/" + p] = code;
       } else {
+        const code = entry.error?.code;
+        if (FATAL_CODES.has(code)) {
+          if (code === "BUDGET_EXCEEDED") budgetExceeded = true;
+          if (code === "SEMAPHORE_TIMEOUT") semaphoreTimedOut = true;
+        }
         console.warn(
           `[AI] File ${entry.file.path} failed in round ${round}: ${entry.error?.message || entry.error}`,
         );
@@ -835,6 +860,13 @@ export async function generateProject(prompt, callbacks, options = {}) {
       }
     }
     pendingFiles = failedFiles;
+
+    if (budgetExceeded || semaphoreTimedOut) {
+      console.warn(
+        `[AI] Fatal (${budgetExceeded ? "budget" : "semaphore"}) hit in round ${round}, stopping retry loop. ${pendingFiles.length} file(s) will become placeholders.`,
+      );
+      break;
+    }
   }
 
   if (pendingFiles.length > 0) {
@@ -857,17 +889,32 @@ export async function generateProject(prompt, callbacks, options = {}) {
       if (ext === "css") {
         files[key] = `/* ${purpose} - generation failed, please retry */\n`;
       } else {
+        // F8.3: placeholder mengikuti contract (named vs default export yang
+        // diharapkan importer) supaya bundle tidak pecah.
+        const exp = parseExports(file.exports, file.path);
+        const baseName =
+          file.path
+            .split("/")
+            .pop()
+            ?.replace(/\.\w+$/, "") || "Placeholder";
+        const fnName = exp.defaultExport || baseName || "Placeholder";
+        const namedLines = (exp.namedExports || [])
+          .filter((n) => n !== fnName)
+          .map((n) => `export const ${n} = ${fnName};`)
+          .join("\n");
+
         files[key] =
           "import React from 'react';\n\n" +
           `// This file could not be generated. Please retry.\n` +
           `// Purpose: ${purpose}\n\n` +
-          "export default function Placeholder() {\n" +
+          `export default function ${fnName}() {\n` +
           "  return (\n" +
           "    <div className='p-8 text-center text-zinc-400'>\n" +
           "      <p>Component failed to generate. Please try again.</p>\n" +
           "    </div>\n" +
           "  );\n" +
-          "}\n";
+          "}\n" +
+          (namedLines ? `\n${namedLines}\n` : "");
       }
     }
   }
@@ -876,7 +923,6 @@ export async function generateProject(prompt, callbacks, options = {}) {
     throw new Error("AI did not generate /App.js entry point");
   }
 
-  // Phase 3: contract checker.
   let finalFiles = files;
   try {
     const check = checkContract(files, contract);
@@ -896,14 +942,12 @@ export async function generateProject(prompt, callbacks, options = {}) {
       );
     }
   } catch (err) {
-    // the checker must never lose a generated project
     console.error(
       "[Contract] checker failed, keeping files as generated:",
       err,
     );
   }
 
-  // Phase 3.5: reconcile uploaded images.
   try {
     const reconciled = await reconcileUploadedImages(
       finalFiles,
@@ -917,39 +961,17 @@ export async function generateProject(prompt, callbacks, options = {}) {
     console.error("[ImageReconcile] failed, keeping files as-is:", err);
   }
 
-  // ── C1: fact guard (generation, enforce) ────────────────────────────────
-  // Runs only when a brief exists, after the file rounds, before checkContract
-  // already ran. Blocks by regenerating the worst files ONCE, and only accepts
-  // the new code when the blocking violation count is lower.
-  // HARNESS_FACT_GUARD=0 disables it.
-  if (
-    options.brief &&
-    process.env.HARNESS_FACT_GUARD !== "0" &&
-    FACT_GUARD_MAX_FILES > 0
-  ) {
+  if (process.env.HARNESS_FACT_GUARD !== "0" && FACT_GUARD_MAX_FILES > 0) {
     try {
-      const sources = [
-        String(prompt ?? ""),
-        String(briefBlock ?? ""),
-        String(referenceContext ?? ""),
-      ];
-      const answers = options.brief?.answers ?? {};
-      const slots = Array.isArray(options.brief?.slots)
-        ? options.brief.slots
-        : [];
-      for (const slot of slots) {
-        const v = answers[slot.key]?.value;
-        if (typeof v === "string" && v.trim()) sources.push(v);
-        if (typeof slot.placeholder === "string" && slot.placeholder.trim()) {
-          sources.push(slot.placeholder);
-        }
-      }
-      for (const factValue of Object.values(contract.facts ?? {})) {
-        if (typeof factValue === "string" && factValue.trim()) {
-          sources.push(factValue);
-        }
-      }
-      const allow = buildAllowlist(sources);
+      // F7: satu sumber fakta, jalan untuk semua project (brief maupun tidak).
+      // Project tanpa brief = sumber dari prompt + refs + contract.facts.
+      const factCtx = buildFactContext({
+        prompt,
+        brief: options.brief ?? null,
+        referenceContext,
+        contract,
+      });
+      const allow = factCtx.allow;
 
       const blockingKinds = new Set([
         "phone",
@@ -959,8 +981,6 @@ export async function generateProject(prompt, callbacks, options = {}) {
         "rating",
         "year",
       ]);
-
-      // Score each candidate file by its blocking violation count.
       const scored = [];
       for (const [p, code] of Object.entries(finalFiles)) {
         if (!/\.(jsx?)$/i.test(p)) continue;
@@ -972,7 +992,7 @@ export async function generateProject(prompt, callbacks, options = {}) {
       }
 
       if (scored.length === 0) {
-        console.log(`[FactGuard] generation: no invented facts detected`);
+        console.log(`[FactGuard] generation: no invented facts`);
       } else {
         scored.sort((a, b) => b.blocking.length - a.blocking.length);
         const toFix = scored.slice(0, FACT_GUARD_MAX_FILES);
@@ -988,22 +1008,18 @@ export async function generateProject(prompt, callbacks, options = {}) {
             description: "existing project file",
           };
           const values = entry.blocking.map((f) => f.value);
-          const lastError = `Invented facts: ${JSON.stringify(
-            values,
-          )}. Use only values from the brief; where data is missing use the placeholder text from the brief.`;
+          const lastError = `Invented facts: ${JSON.stringify(values)}. Use only values that appear in the brief or the prompt; where data is missing use the placeholder text from the brief.`;
           const retryFile = { ...fileSpec, lastError };
-
           try {
             const regen = await generateSingleFile(
               retryFile,
               plan.files,
               aiPrompt,
-              // keep the current file source as context so the model can keep
-              // the working parts
               { ...finalFiles, [entry.path]: before },
               assets,
               contract,
               hasBrief,
+              plan.dataSpec ?? null,
             );
             const afterFacts = findInventedFacts(regen.code, allow);
             const afterCount = afterFacts.filter((f) =>
@@ -1031,7 +1047,6 @@ export async function generateProject(prompt, callbacks, options = {}) {
     }
   }
 
-  // Phase 4: expand Tailwind directives in stylesheets.
   try {
     const style = await fixStylesheets(finalFiles);
     finalFiles = style.files;
@@ -1058,7 +1073,171 @@ export async function generateProject(prompt, callbacks, options = {}) {
     );
   }
 
-  // Unsplash API rule: trigger download for each used photo
+  // ── F3: finalize step ────────────────────────────────────────────────
+  let finalizeIssues = [];
+  if (process.env.HARNESS_FINAL_REVALIDATE !== "0") {
+    try {
+      const fin = await finalizeProject(finalFiles, contract);
+      finalizeIssues = fin.issues;
+
+      if (fin.blocking > 0) {
+        console.warn(
+          `[Finalize] ${fin.blocking} blocking issue(s):\n  - ` +
+            fin.issues
+              .filter((i) => i.severity === "blocking")
+              .map((i) => `${i.path || "*"}: ${i.message}`)
+              .join("\n  - "),
+        );
+      }
+      const fixedCount = fin.issues.filter((i) => i.autoFixed).length;
+      if (fixedCount > 0) {
+        console.log(`[Finalize] ${fixedCount} fix(es) applied`);
+      }
+      finalFiles = fin.files;
+    } catch (err) {
+      console.error("[Finalize] crashed, keeping files as-is:", err);
+    }
+  }
+
+  // ── F5: QA gate ──────────────────────────────────────────────────────
+  // WAJIB di function scope: ketiga variabel ini dipakai di return statement.
+  // ── F5: QA gate + diagnostic repair loop (F5.6) ──────────────────────
+  let gateIssues = [];
+  let gateStages = {};
+  let gateMode = "off";
+
+  if (process.env.HARNESS_QA_GATE !== "0") {
+    const MAX_REPAIR = Math.max(
+      0,
+      parseInt(process.env.GEN_BUDGET_MAX_REPAIR_ROUNDS || "1", 10) || 1,
+    );
+
+    for (let round = 0; round <= MAX_REPAIR; round++) {
+      let gate;
+      try {
+        gate = await runQualityGate(finalFiles, contract);
+      } catch (err) {
+        console.error("[QA] gate crashed, skipping:", err);
+        break;
+      }
+
+      gateMode = gate.mode;
+      gateStages = gate.stages;
+      gateIssues = gate.reportable ? gate.issues : [];
+
+      const fmt = (i) =>
+        `${i.code}${i.path ? ` @ ${i.path}` : ""}: ${i.message}`;
+
+      if (gate.mode === "shadow") {
+        if (gate.loggable.length > 0) {
+          console.log(
+            `[QA] shadow: ${gate.loggable.length} blocking issue(s) (not applied):\n  - ` +
+              gate.loggable.map(fmt).join("\n  - "),
+          );
+        } else if (gate.issues.length > 0) {
+          console.log(
+            `[QA] shadow: passed (${gate.issues.length} warning(s) ignored)`,
+          );
+        } else {
+          console.log(`[QA] shadow: passed`);
+        }
+      } else if (gate.mode === "off") {
+        break;
+      } else if (gate.issues.length === 0) {
+        console.log(`[QA] ${gate.mode}: passed (round ${round})`);
+      } else {
+        const blocking = gate.issues.filter((i) => i.severity === "blocking");
+        console.log(
+          `[QA] ${gate.mode}: ${gate.issues.length} issue(s), ${blocking.length} blocking (round ${round})\n  - ` +
+            gate.issues.map(fmt).join("\n  - "),
+        );
+      }
+
+      // Repair hanya di mode enforce
+      if (gate.mode !== "enforce") break;
+      if (round >= MAX_REPAIR) break;
+
+      const blocking = gate.issues.filter((i) => i.severity === "blocking");
+      if (blocking.length === 0) break;
+
+      // Budget guard
+      const budget = getBudgetSummary();
+      if (budget?.exceeded) {
+        console.warn(`[QA] budget exceeded, stopping repair`);
+        break;
+      }
+
+      // Group blocking by path
+      const byPath = new Map();
+      for (const issue of blocking) {
+        const p = issue.path;
+        if (!p || p === "*") continue;
+        if (!byPath.has(p)) byPath.set(p, []);
+        byPath.get(p).push(issue);
+      }
+
+      if (byPath.size === 0) {
+        console.warn(
+          `[QA] ${blocking.length} blocking issue(s) without a specific path, cannot repair`,
+        );
+        break;
+      }
+
+      console.log(
+        `[QA] repair round ${round + 1}/${MAX_REPAIR}: regenerating ${byPath.size} file(s): ${[...byPath.keys()].join(", ")}`,
+      );
+
+      for (const [path, issuesForFile] of byPath) {
+        const fileSpec = plan.files.find((f) => f.path === path) || {
+          path,
+          description: "existing project file",
+        };
+        const lastError =
+          "QA gate: " +
+          issuesForFile
+            .map((i) => `${i.code}: ${i.message}`)
+            .join("; ")
+            .slice(0, 280);
+        const retryFile = { ...fileSpec, lastError };
+        try {
+          const regen = await generateSingleFile(
+            retryFile,
+            plan.files,
+            aiPrompt,
+            finalFiles,
+            assets,
+            contract,
+            hasBrief,
+            plan.dataSpec ?? null,
+          );
+          finalFiles[path] = regen.code;
+          console.log(`[QA] repaired ${path} (${regen.code.length} chars)`);
+        } catch (err) {
+          console.warn(`[QA] regen failed for ${path}: ${err.message}`);
+        }
+      }
+
+      // Setelah repair: re-finalize + re-stylesheet, lalu loop akan
+      // menjalankan gate lagi.
+      if (process.env.HARNESS_FINAL_REVALIDATE !== "0") {
+        try {
+          const fin = await finalizeProject(finalFiles, contract);
+          finalFiles = fin.files;
+          for (const i of fin.issues) finalizeIssues.push(i);
+        } catch (err) {
+          console.error("[Finalize] post-repair failed:", err);
+        }
+      }
+      try {
+        const style = await fixStylesheets(finalFiles);
+        finalFiles = style.files;
+      } catch (err) {
+        console.warn("[Styles] post-repair failed:", err);
+      }
+    }
+  }
+
+  // Unsplash download
   if (stockAssets.length > 0) {
     const accessKey = process.env.UNSPLASH_ACCESS_KEY;
     for (const asset of stockAssets) {
@@ -1072,9 +1251,6 @@ export async function generateProject(prompt, callbacks, options = {}) {
     );
   }
 
-  // B4: fixed = every final file whose content differs from what the caller
-  // already received via onFileComplete. This covers contract fixes,
-  // stylesheet fixes, image reconcile, and later fact repairs.
   const fixed = {};
   for (const [p, code] of Object.entries(finalFiles)) {
     const key = normPath(p);
@@ -1087,6 +1263,14 @@ export async function generateProject(prompt, callbacks, options = {}) {
     files: finalFiles,
     fixed,
     description: plan.projectDescription,
+    dataSpec: plan.dataSpec ?? null,
+    finalizeIssues,
+    budgetExceeded,
+    semaphoreTimedOut,
+    budget: getBudgetSummary(),
+    gateIssues,
+    gateStages,
+    gateMode,
   };
 }
 
@@ -1449,15 +1633,18 @@ export async function rewriteFile(
   let lastError = "";
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const { text, finishReason, usage } = await generate({
-        model,
-        system,
-        prompt: lastError
-          ? `${baseMsg}\n\nYour previous answer was rejected: ${lastError}\nFix that and return the complete file again.`
-          : baseMsg,
-        maxRetries: 2,
-        maxOutputTokens: MAX_OUTPUT_TOKENS,
-      });
+      const { text, finishReason, usage } = await withSlot(
+        `rewrite ${filePath}`,
+        () =>
+          generate({
+            model,
+            system,
+            prompt: lastError ? `...` : baseMsg,
+            maxRetries: 2,
+            maxOutputTokens: MAX_OUTPUT_TOKENS,
+          }),
+      );
+
       recordUsage(`rewrite ${filePath}`, usage);
 
       if (finishReason === "length") {

@@ -3,6 +3,8 @@
 // --- System Prompts ---
 // All AI prompts are centralized here for easy editing and consistency.
 
+import { isDynamicAppsEnabled } from "../config/env.js";
+
 // Legacy base. Do not edit: byte-identical output for projects without a brief.
 const BASE_SYSTEM_LEGACY = `You are an elite Senior Frontend Developer and UI/UX Designer with deep expertise in React and Tailwind CSS. You build world-class, production-ready websites that feel like they were crafted by a top-tier design agency — with the visual quality of Stripe, Linear, Vercel, or Loom landing pages.
 
@@ -322,6 +324,7 @@ Good copy makes design feel premium. Follow these rules:
 - Headings must use semantic tags: \`<h1>\`, \`<h2>\`, \`<h3>\` — not just styled \`<div>\`s
 - Use \`<nav>\`, \`<main>\`, \`<section>\`, \`<footer>\` semantic HTML elements
 - Add \`id\` attributes to sections for anchor nav (e.g., \`id='features'\`, \`id='pricing'\`)
+- NEVER use \`data:\` URIs or \`bg-[url(...)]\` inside \`className\`. JSX attribute strings do not process backslash escapes, so an inline SVG data URI like \`bg-[url("data:image/svg+xml,...width=\\'60\\'...")\` breaks the parser. Put decorative patterns in \`/styles.css\` as a class (e.g. \`.bg-pattern { background-image: ...; }\`) and reference it with \`className='bg-pattern'\`.
 
 ## CODE CORRECTNESS — MANDATORY RULES
 - Every .js component file MUST have exactly ONE default export. E.g., \`export default function Header() { ... }\`
@@ -391,6 +394,9 @@ const BASE_SYSTEM_BRIEF = (() => {
 export function buildBase({ hasBrief } = {}) {
   return hasBrief ? BASE_SYSTEM_BRIEF : BASE_SYSTEM_LEGACY;
 }
+
+const DATA_SPEC_PLAN_LINE = `
+- "dataSpec": optional. If the project needs to save data (like a contact form, order form, or a todo list), propose a schema here. Example: { "collections": [{ "name": "messages", "label": "Pesan Masuk", "fields": [{ "key": "nama", "label": "Nama", "type": "string", "required": true }] }] }. If you propose dataSpec, DO NOT plan /lib/renscraft.js. The server will inject it automatically for you.`;
 
 // Body of the planner prompt. Reused by both brief and legacy modes.
 const FILE_PLAN_SYSTEM_BODY = `
@@ -500,10 +506,12 @@ export const FILE_PLAN_SYSTEM = `${BASE_SYSTEM_LEGACY}${FILE_PLAN_SYSTEM_BODY}`;
 export const REVISE_SYSTEM = `${BASE_SYSTEM_LEGACY}${REVISE_SYSTEM_BODY}`;
 
 export function buildFilePlanSystem({ hasBrief } = {}) {
-  if (!hasBrief) return FILE_PLAN_SYSTEM;
-  return `${BASE_SYSTEM_BRIEF}${FILE_PLAN_SYSTEM_BODY}${BRIEF_PLANNER_RULES}`;
-}
+  const base = hasBrief
+    ? `${BASE_SYSTEM_BRIEF}${FILE_PLAN_SYSTEM_BODY}${BRIEF_PLANNER_RULES}`
+    : FILE_PLAN_SYSTEM;
 
+  return isDynamicAppsEnabled() ? `${base}${DATA_SPEC_PLAN_LINE}` : base;
+}
 export function buildReviseSystem({ hasBrief } = {}) {
   if (!hasBrief) return REVISE_SYSTEM;
   return `${BASE_SYSTEM_BRIEF}${REVISE_SYSTEM_BODY}`;

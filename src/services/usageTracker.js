@@ -17,6 +17,12 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs/promises";
 import path from "node:path";
+import {
+  initBudget,
+  recordBudget,
+  budgetSummary,
+  assertBudget as assertBudgetImpl,
+} from "./budget.js";
 
 const als = new AsyncLocalStorage();
 
@@ -85,6 +91,7 @@ export function summarize(store, pricing = getPricing()) {
     ms: store.end - store.start,
     pricing,
     byLabel,
+    budget: budgetSummary(store),
   };
 }
 
@@ -130,6 +137,8 @@ export async function withUsageTracking(
     end: 0,
   };
 
+  initBudget(store);
+
   try {
     return await als.run(store, fn);
   } catch (err) {
@@ -162,6 +171,7 @@ export function recordUsage(label, usage, modelName = null) {
     reasoning: num(usage.outputTokenDetails?.reasoningTokens),
     model: modelName ?? null,
   });
+  recordBudget(store, usage);
 }
 
 // Untuk handler yang menangkap error sendiri (mis. chatController): tandai
@@ -171,4 +181,14 @@ export function markUsageFailed(err) {
   if (!store) return;
   store.ok = false;
   store.error = err?.message ?? String(err ?? "failed");
+}
+
+// F4: dipanggil dari ai.js sebelum setiap panggilan LLM.
+export function assertBudgetNow(label = "") {
+  assertBudgetImpl(als.getStore(), label);
+}
+
+// F4: dipakai generateProject untuk melaporkan pemakaian budget.
+export function getBudgetSummary() {
+  return budgetSummary(als.getStore());
 }

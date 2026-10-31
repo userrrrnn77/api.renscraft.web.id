@@ -11,7 +11,7 @@ const MIN_SECRET_LENGTH = 32;
 // What the code used to fall back to. Anyone who has read the source knows it.
 const REJECTED_SECRETS = new Set(["fallback_secret"]);
 // Vite's default dev server. Only used outside production when ORIGINS is unset.
-const DEV_ORIGINS = ["https://ai.rensdev.my.id","http://localhost:5173"];
+const DEV_ORIGINS = ["https://renscraft.web.id", "http://localhost:5173"];
 
 const isProduction = () => process.env.NODE_ENV === "production";
 
@@ -39,26 +39,60 @@ export function getJwtSecret() {
   return secret;
 }
 
+// src/config/env.js
+
+// src/config/env.js
+
 export function getAllowedOrigins() {
   const origins = String(process.env.ORIGINS ?? "")
     .split(",")
-    // browsers send the Origin header without a trailing slash
     .map((origin) => origin.trim().replace(/\/+$/, ""))
     .filter(Boolean);
 
   if (origins.includes("*")) {
     throw new Error(
-      'ORIGINS cannot contain "*": the session cookie needs credentials, so list the exact origins',
+      'ORIGINS cannot contain a bare "*": the session cookie needs credentials, so list exact origins or a subdomain wildcard like "https://*.example.com"',
     );
   }
   if (origins.length > 0) return origins;
-
   if (isProduction()) {
     throw new Error(
       "ORIGINS is not set. Use a comma-separated list, e.g. https://app.example.com",
     );
   }
   return [...DEV_ORIGINS];
+}
+
+// ─── Wildcard subdomain support ────────────────────────────────────────────
+// Pattern di ORIGINS:
+//   "https://renscraft.cyou"     → exact match
+//   "https://*.renscraft.cyou"   → match "https://john.renscraft.cyou",
+//                                    TIDAK match "https://a.b.renscraft.cyou"
+//
+// Request tanpa Origin header (curl, server-to-server) → diizinkan.
+export function isOriginAllowed(origin) {
+  // ⬆️ NO annotation. Ini .js, bukan .ts.
+  if (!origin) return true; // non-browser request
+
+  const allowed = getAllowedOrigins();
+
+  // 1. Exact match
+  if (allowed.includes(origin)) return true;
+
+  // 2. Wildcard pattern
+  for (const pattern of allowed) {
+    if (!pattern.includes("*")) continue;
+
+    const regexStr = pattern
+      // Escape karakter regex-spesial, KECUALI "*"
+      .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
+      // "*" → satu level subdomain (satu atau lebih karakter selain titik)
+      .replace(/\*/g, "[^.]+");
+
+    if (new RegExp(`^${regexStr}$`).test(origin)) return true;
+  }
+
+  return false;
 }
 
 export function getMidtransConfig() {
@@ -159,9 +193,54 @@ export function validateEnv() {
     );
   }
 
+  const hops = process.env.TRUST_PROXY_HOPS;
+  if (hops !== undefined && hops !== "" && !/^\d+$/.test(String(hops).trim())) {
+    problems.push("TRUST_PROXY_HOPS must be a non-negative integer");
+  }
+
+  if (isDynamicAppsEnabled()) {
+    const runtimeUrl = String(
+      process.env.DYNAMIC_RUNTIME_PUBLIC_URL ?? "",
+    ).trim();
+    if (!runtimeUrl) {
+      problems.push(
+        "DYNAMIC_RUNTIME_PUBLIC_URL is not set (required when DYNAMIC_APPS_ENABLED=1)",
+      );
+    } else {
+      try {
+        const u = new URL(runtimeUrl);
+        if (u.protocol !== "http:" && u.protocol !== "https:") {
+          problems.push("DYNAMIC_RUNTIME_PUBLIC_URL must be an http(s) URL");
+        }
+      } catch {
+        problems.push("DYNAMIC_RUNTIME_PUBLIC_URL is not a valid URL");
+      }
+    }
+  }
+
   if (problems.length > 0) {
     throw new Error(`Invalid environment:\n\n${problems.join("\n")}`);
   }
 
   warnAboutPaymentSetup();
 }
+
+// ─── Dynamic Apps Config ────────────────────────────────────────────────────
+
+export function isDynamicAppsEnabled() {
+  return String(process.env.DYNAMIC_APPS_ENABLED ?? "0").trim() === "1";
+}
+
+export const dynamicConfig = () => ({
+  maxAppsPerUser: parseInt(process.env.DYNAMIC_MAX_APPS_PER_USER || "3", 10),
+  maxCollectionsPerApp: parseInt(
+    process.env.DYNAMIC_MAX_COLLECTIONS_PER_APP || "10",
+    10,
+  ),
+  maxFieldsPerCollection: parseInt(
+    process.env.DYNAMIC_MAX_FIELDS_PER_COLLECTION || "20",
+    10,
+  ),
+  maxDocsPerApp: parseInt(process.env.DYNAMIC_MAX_DOCS_PER_APP || "2000", 10),
+  maxDocBytes: parseInt(process.env.DYNAMIC_MAX_DOC_BYTES || "8192", 10),
+});

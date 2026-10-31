@@ -348,6 +348,46 @@ function shouldSkipText(text: string): boolean {
   return false;
 }
 
+// F7: vague claims. Tidak pernah blocking, cuma warning — "terpercaya"
+// bisa jadi copywriting sah, bukan fakta. Tapi kalau model nulis
+// "ribuan pelanggan" tanpa ada angka di sumber, itu karangan yang
+// bikin website kelihatan bohong.
+const VAGUE_CLAIMS_RE = [
+  {
+    kind: "vague_stat",
+    re: /\b(?:ribuan|ratusan|puluhan\s+ribu|thousands?|hundreds?)\s+(?:pelanggan|customer|client|pengguna|user|member|anggota|penumpang|pasien)\b/gi,
+  },
+  {
+    kind: "vague_guarantee",
+    re: /\b(?:garansi|guarantee)\s+(?:100\s*%|seumur\s+hidup|lifetime|selamanya)\b/gi,
+  },
+  {
+    kind: "vague_claim",
+    re: /\b(?:nomor\s*1\s+di|#1\s+di|terbaik\s+di|the\s+best\s+in|terpercaya|trusted\s+by|dipercaya\s+oleh)\b/gi,
+  },
+  {
+    kind: "vague_time",
+    re: /\b(?:bertahun-tahun|bertahun\s+tahun|for\s+years|sejak\s+dulu|berpengalaman\s+\d+\s+tahun)\b/gi,
+  },
+  {
+    kind: "vague_price",
+    re: /\b(?:paling\s+murah|cheapest|harga\s+terbaik|best\s+price|harga\s+termurah)\b/gi,
+  },
+];
+
+export function findVagueClaims(
+  code: string,
+): Array<{ kind: string; value: string; line: number }> {
+  const out: Array<{ kind: string; value: string; line: number }> = [];
+  const text = String(code || "");
+  for (const { kind, re } of VAGUE_CLAIMS_RE) {
+    for (const m of text.matchAll(re)) {
+      out.push({ kind, value: m[0] ?? "", line: lineOf(text, m.index ?? 0) });
+    }
+  }
+  return out;
+}
+
 export function findInventedFacts(
   code: string,
   allow: FactAllow,

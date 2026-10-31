@@ -12,6 +12,8 @@
 //   3. every file prompt gets the contract (renderContractPrompt)
 //   4. contractChecker.ts verifies + auto-fixes the result afterwards
 import path from "node:path";
+import { generateRenstraftSdk } from "./dynamicSdk.js";
+import { isDynamicAppsEnabled } from "../../config/env.js";
 
 // ── Plan (what the planner returns) ─────────────────────────────────────────
 
@@ -41,12 +43,27 @@ export interface PlanDesign {
   radius?: string;
 }
 
+export interface PlanDataSpec {
+  collections: Array<{
+    name: string;
+    label: string;
+    fields: Array<{
+      key: string;
+      label: string;
+      type: string;
+      required?: boolean;
+      options?: string[];
+    }>;
+  }>;
+}
+
 export interface ProjectPlan {
   files: PlanFile[];
   projectName: string;
   projectDescription: string;
   facts?: PlanFacts;
   design?: PlanDesign;
+  dataSpec?: PlanDataSpec;
 }
 
 // ── Contract ────────────────────────────────────────────────────────────────
@@ -356,6 +373,24 @@ export function applyContractToPlan(
   const hasNav = files.some(
     (f) => isJs(f.path) && NAV_RE.test(baseName(f.path)),
   );
+
+  const dataSpec = isDynamicAppsEnabled() ? rawPlan.dataSpec : undefined;
+
+  let sdkPath: string | null = null;
+  if (dataSpec) {
+    sdkPath = "/lib/renscraft.js";
+    const sdkEntry = {
+      path: sdkPath,
+      description:
+        "Database SDK written by the server. Import { db } from '../lib/renscraft'",
+      exports: "named db",
+      imports: [],
+    };
+    const planned = files.find((f) => f.path === sdkPath);
+    if (planned) Object.assign(planned, sdkEntry);
+    else files.push(sdkEntry);
+  }
+
   const sectionFiles = files.filter(
     (f) =>
       hasNav &&
@@ -370,11 +405,20 @@ export function applyContractToPlan(
   // 3. per-file contract
   const contractFiles: FileContract[] = files.map((f) => {
     const exp = parseExports(f.exports, f.path);
+
+    let serverContent = null;
+    if (f.path === themePath) {
+      serverContent = THEME_CONTEXT_SOURCE;
+    } else if (f.path === sdkPath) {
+      // ✅ SDK di-inject
+      serverContent = generateRenstraftSdk("draft-slug", false);
+    }
+
     return {
       path: f.path,
       defaultExport: exp.defaultExport,
       namedExports: exp.namedExports,
-      serverContent: f.path === themePath ? THEME_CONTEXT_SOURCE : null,
+      serverContent,
       sectionId: sectionIds.get(f.path) ?? null,
     };
   });
@@ -383,7 +427,9 @@ export function applyContractToPlan(
     files.find((f) => /^\/App\.jsx?$/i.test(f.path))?.path ?? "/App.js";
 
   return {
-    plan: { ...rawPlan, files },
+    plan: { ...rawPlan, files, dataSpec },
+    // Type 'PlanDataSpec | null' is not assignable to type 'PlanDataSpec | undefined'.
+    // Type 'null' is not assignable to type 'PlanDataSpec | undefined'.
     contract: {
       entryPath: entry,
       needsTheme,
