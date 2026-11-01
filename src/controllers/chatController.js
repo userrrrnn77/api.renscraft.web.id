@@ -23,7 +23,6 @@ import {
 import {
   chargeCredits,
   creditCosts,
-  getBalance,
   refundCredits,
   refundHeld,
   rejectCharge,
@@ -39,6 +38,7 @@ import { saveProjectVersion } from "../services/projectVersions.js";
 import { buildFactContext } from "../services/contract/factContext.js";
 import { runQualityGate } from "../services/qa/qualityGate.js";
 import { buildQualityReport } from "../services/quality.js";
+import { createHeartbeat } from "../services/heartbeat.js";
 
 const MAX_PROMPT_LENGTH = 4000;
 
@@ -57,6 +57,9 @@ export const buildManifest = (files) => {
 const NOISE_RE =
   /^(Created file |Planning project|Planned website structure|Website generation complete)/;
 
+// ─── POST /api/projects/:id/chat ────────────────────────────────────────────
+// Bagian sinkron: validasi + charge + lock + simpan pesan user. Setelah itu
+// balas 202 dan jalankan revisi di background.
 const chatHandler = async (req, res) => {
   const prompt =
     typeof req.body?.prompt === "string" ? req.body.prompt.trim() : "";
@@ -111,8 +114,44 @@ const chatHandler = async (req, res) => {
       content: prompt,
       timestamp: new Date(),
     });
+    project.error = null;
+    project.errorCode = null;
     await project.save();
+  } catch (err) {
+    // Lock sudah terpasang dan kredit sudah dipotong: lepas + refund sebelum 500.
+    await Project.updateOne(
+      { _id: project._id },
+      { $set: { status: "completed" } },
+    ).catch(() => {});
+    await refundHeld(project._id);
+    throw err;
+  }
 
+  res.status(202).json({
+    ...serializeProject(project),
+    credits: charge.balance,
+  });
+
+  // Fire-and-forget. withUsageTracking membungkus JOB, bukan handler HTTP.
+  withUsageTracking("revision", () => runBackgroundRevision(project, prompt), {
+    projectId: String(project._id),
+  }).catch((err) => {
+    console.error(
+      `[Background Revision] Fatal error for project ${project._id}: `,
+      err,
+    );
+  });
+};
+
+// ─── Background revision ────────────────────────────────────────────────────
+// Tidak pernah memakai `res`. Semua hasil lewat project (status, errorCode,
+// pesan assistant). Penulisan akhir pakai CAS { status: "revising" } supaya
+// tidak menimpa project yang sudah di-settle (settleIfStale / recovery).
+const runBackgroundRevision = async (project, prompt) => {
+  const heartbeat = createHeartbeat(project._id);
+  heartbeat.start();
+
+  try {
     let healed = false;
     for (const [path, entry] of Object.entries(project.files || {})) {
       if (typeof entry?.content !== "string") continue;
@@ -391,26 +430,13 @@ const chatHandler = async (req, res) => {
       if (m) touchedPaths.add(m[1]);
     }
 
+    const newVersion = project.version + 1;
+    let newQuality = null;
+
     if (shouldCommit) {
-      const newVersion = project.version + 1;
-      await saveProjectVersion({
-        projectId: project._id,
-        version: newVersion,
-        files: finalFiles,
-        prompt,
-        quality: project.quality ?? null,
-      }).catch((err) =>
-        console.error("[Version] save failed, continuing:", err),
-      );
-
-      project.files = finalFiles;
-      project.markModified("files");
-      project.version = newVersion;
-      project.creditsHeld = 0;
-
       // F5.8: simpan hasil gate revisi ke QualityReport
       if (revisionGateMode !== "off") {
-        project.quality = buildQualityReport(
+        newQuality = buildQualityReport(
           revisionGateIssues.map((i) => ({
             code: i.code,
             severity: i.severity,
@@ -421,7 +447,6 @@ const chatHandler = async (req, res) => {
           })),
           { stages: revisionGateStages, version: newVersion },
         );
-        project.markModified("quality");
       }
     } else if (atomicAbort) {
       console.log(
@@ -558,9 +583,7 @@ const chatHandler = async (req, res) => {
       }
     }
 
-    project.status = "completed";
-    project.error = null;
-    project.errorCode = zeroOperations
+    const errorCode = zeroOperations
       ? "REVISION_NO_CHANGE"
       : atomicAbort
         ? "REVISION_ABORTED"
@@ -584,61 +607,91 @@ const chatHandler = async (req, res) => {
           : "");
     }
 
-    project.messages.push({
-      role: "assistant",
-      content: assistantMessage,
-    });
-
-    await project.save();
-
-    const refunded = !shouldCommit ? await refundHeld(project._id) : 0;
-
-    if (atomicAbort) {
-      return res.status(409).json({
-        error: assistantMessage,
-        code: "REVISION_ABORTED",
-        params: { failedOps: errors.length },
-        credits: await getBalance(owner),
-        refunded,
-        ...serializeProject(project),
-      });
+    const $set = { status: "completed", error: null, errorCode };
+    if (shouldCommit) {
+      $set.files = finalFiles;
+      $set.version = newVersion;
+      $set.creditsHeld = 0; // kredit terpakai, jangan di-refund
+      if (newQuality) $set.quality = newQuality;
+    } else if (healed) {
+      $set.files = project.files; // heal entity newline tetap tersimpan
     }
 
-    res.json({
-      ...serializeProject(project),
-      applied,
-      errors,
-      autoFixes,
-      aiDescription: result.description,
-      credits: await getBalance(owner),
-      refunded,
-    });
+    // CAS: kalau sudah di-settle dari luar (stale/recovery), buang hasil.
+    const settled = await Project.findOneAndUpdate(
+      { _id: project._id, status: "revising", version: project.version },
+      {
+        $set,
+        $push: {
+          messages: {
+            role: "assistant",
+            content: assistantMessage,
+            timestamp: new Date(),
+          },
+        },
+      },
+      { returnDocument: "after" },
+    );
+
+    if (!settled) {
+      console.warn(
+        `[Background Revision] Project ${project._id} was settled externally. Discarding result.`,
+      );
+      return;
+    }
+
+    if (shouldCommit) {
+      await saveProjectVersion({
+        projectId: project._id,
+        version: newVersion,
+        files: finalFiles,
+        prompt,
+        quality: project.quality ?? null,
+      }).catch((err) =>
+        console.error("[Version] save failed, continuing:", err),
+      );
+    } else {
+      await refundHeld(project._id);
+    }
+
+    console.log(
+      `[Background Revision] ${project._id} done: ${errorCode ?? "ok"}${shouldCommit ? ` v${newVersion}` : ""}`,
+    );
   } catch (err) {
     markUsageFailed(err);
-    console.error(`[AI Revision Error] ${err.message}`);
+    console.error(
+      `[AI Revision Error] project ${project._id}: ${err?.message ?? err}`,
+    );
     try {
-      await Project.updateOne(
-        { _id: project._id },
-        { $set: { status: "completed" } },
+      const failed = await Project.findOneAndUpdate(
+        { _id: project._id, status: "revising" },
+        {
+          $set: { status: "completed", error: null, errorCode: "CHAT_FAILED" },
+          $push: {
+            messages: {
+              role: "assistant",
+              content:
+                "Revisi gagal diproses. Versi project tidak berubah dan kredit sudah dikembalikan. Coba lagi.",
+              timestamp: new Date(),
+            },
+          },
+        },
       );
+      if (failed) await refundHeld(project._id);
+      else
+        console.warn(
+          `[AI Revision Error] project ${project._id} already settled, no refund needed`,
+        );
     } catch (releaseErr) {
+      // Project tetap "revising": settleIfStale / recoverStaleProjects yang
+      // akan menutup + refund.
       console.error(
-        `[AI Revision Error] could not release project ${project._id}: ${releaseErr.message}`,
+        `[AI Revision Error] could not settle project ${project._id}: ${releaseErr.message}`,
       );
     }
-    const refunded = await refundHeld(project._id);
-    res.status(500).json({
-      error: err.message || "Failed to process revision request",
-      code: "CHAT_FAILED",
-      params: {},
-      credits: await getBalance(owner),
-      refunded,
-    });
+  } finally {
+    heartbeat.stop();
   }
 };
 
-export const chat = asyncHandler((req, res) =>
-  withUsageTracking("revision", () => chatHandler(req, res), {
-    projectId: req.params.id,
-  }),
-);
+export const chat = asyncHandler(chatHandler);

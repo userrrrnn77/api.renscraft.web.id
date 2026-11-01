@@ -38,6 +38,7 @@
     "esbuild": "^0.28.2",
     "express": "4",
     "jsonwebtoken": "^9.0.3",
+    "jszip": "^3.10.2",
     "midtrans-client": "^1.4.3",
     "mongoose": "^9.10.4",
     "nodemailer": "^10.2.1",

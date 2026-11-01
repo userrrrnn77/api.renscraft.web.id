@@ -1,4 +1,4 @@
-// src/services/contract/projectContract.ts
+// FILE: src/services/contract/projectContract.ts
 //
 // The "project contract": everything that has to be identical across files, fixed
 // BEFORE any file is generated.
@@ -78,13 +78,58 @@ export interface FileContract {
   sectionId: string | null;
 }
 
+// Design V2: the preset attached by designFromBrief() when PROMPT_V2 is on and
+// the project has a brief. The shape mirrors vibePresets.js exactly (id, source,
+// hint, tokens, dark, fonts, radius, border, shadow, avoid, note).
+export interface DesignPreset {
+  id: string;
+  source: string;
+  hint: string;
+  tokens: {
+    bg: string;
+    surface: string;
+    ink: string;
+    muted: string;
+    line: string;
+    accent: string;
+    accentInk: string;
+    accent2?: string;
+    accent3?: string;
+    bgImage?: string;
+  };
+  dark: {
+    bg: string;
+    surface: string;
+    ink: string;
+    muted: string;
+    line: string;
+    accent?: string;
+    accentInk?: string;
+  } | null;
+  fonts: {
+    display: { family: string; weights: string; kind: string };
+    body: { family: string; weights: string; kind: string };
+    code?: { family: string; weights: string; kind: string };
+  };
+  radius: string;
+  border: string;
+  shadow: string;
+  avoid: string[];
+  note: string;
+}
+
 // C4: design tokens. Non-null for a fresh generation (defaults applied).
 // null for a derived contract (revision): the project's current design is
 // whatever its files already contain, so no design block is rendered.
+//
+// Design V2: `preset` is optional. When present, renderContractPrompt writes the
+// "Design system" block instead of the legacy "Design tokens" block, and
+// designTokens.js injects the CSS variables into /styles.css.
 export interface DesignTokens {
   accent: string;
   font: string;
   radius: string;
+  preset?: DesignPreset | null;
 }
 
 export interface ProjectContract {
@@ -454,6 +499,35 @@ function importLine(from: string, fc: FileContract): string | null {
   return `import ${parts} from '${src}';`;
 }
 
+// Design V2: the prompt block that replaces the legacy "### Design tokens"
+// section when a server-fixed preset is attached to the contract.
+function renderDesignSystemBlock(preset: DesignPreset): string[] {
+  const fonts = preset.fonts;
+  const tokens = preset.tokens;
+
+  const codePart = fonts.code ? `, code '${fonts.code.family}'` : "";
+  const accent2Part = tokens.accent2 ? `, accent-2 ${tokens.accent2}` : "";
+  const accent3Part = tokens.accent3 ? `, accent-3 ${tokens.accent3}` : "";
+  const avoid = preset.avoid.join("; ");
+
+  const block: string[] = [
+    "### Design system (fixed by the server, use EXACTLY, it overrides any style default)",
+    `- Style: ${preset.id}. ${preset.hint}`,
+    `- Fonts: display '${fonts.display.family}', body '${fonts.body.family}'${codePart}. The server imports them in /styles.css.`,
+    `- Radius: ${preset.radius}. Border: ${preset.border}. Shadow: ${preset.shadow}.`,
+    `- Palette (already defined as CSS variables): bg ${tokens.bg}, surface ${tokens.surface}, ink ${tokens.ink}, muted ${tokens.muted}, line ${tokens.line}, accent ${tokens.accent} with text ${tokens.accentInk}${accent2Part}${accent3Part}.`,
+    "- Semantic classes: bg-app bg-surface bg-tint bg-accent text-ink text-muted text-accent text-on-accent border-line border-accent font-display font-body font-code. For hover/focus/responsive states use typed values like hover:bg-[color:var(--c-accent)].",
+    "- Colors from semantic classes switch by themselves in dark mode: no dark: counterpart needed.",
+    `- Avoid: ${avoid}`,
+  ];
+
+  if (preset.note) {
+    block.push(`- ${preset.note}`);
+  }
+
+  return block;
+}
+
 export function renderContractPrompt(
   contract: ProjectContract,
   filePath: string,
@@ -550,14 +624,22 @@ export function renderContractPrompt(
   // and font cannot drift file to file. Omitted when the contract was derived
   // from existing files (revision): the project's current design is what its
   // files already contain.
+  //
+  // Design V2: when a preset is attached, its "Design system" block replaces the
+  // legacy "Design tokens" block. Contracts without a preset still get exactly
+  // the old block, byte-for-byte.
   if (contract.design) {
-    lines.push(
-      "",
-      "### Design tokens (use EXACTLY these values in every file; do not pick another accent or font)",
-      `- Accent: ${contract.design.accent} (use for every accent color: primary buttons, active states, gradient text stops, key highlights)`,
-      `- Font: ${contract.design.font} (import from Google Fonts in /styles.css and set it on body)`,
-      `- Radius: ${contract.design.radius} (use for cards, panels, buttons, inputs)`,
-    );
+    if (contract.design.preset) {
+      lines.push("", ...renderDesignSystemBlock(contract.design.preset));
+    } else {
+      lines.push(
+        "",
+        "### Design tokens (use EXACTLY these values in every file; do not pick another accent or font)",
+        `- Accent: ${contract.design.accent} (use for every accent color: primary buttons, active states, gradient text stops, key highlights)`,
+        `- Font: ${contract.design.font} (import from Google Fonts in /styles.css and set it on body)`,
+        `- Radius: ${contract.design.radius} (use for cards, panels, buttons, inputs)`,
+      );
+    }
   }
 
   return lines.join("\n");

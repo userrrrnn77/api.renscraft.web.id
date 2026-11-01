@@ -25,6 +25,7 @@ import { asyncHandler } from "../utils/asyncHandler.js";
 import { fail } from "../utils/apiError.js";
 import { buildQualityReport } from "../services/quality.js";
 import { createHeartbeat } from "../services/heartbeat.js";
+import { runQualityGate } from "../services/qa/qualityGate.js";
 
 const MAX_PROMPT_LENGTH = 4000;
 const MAX_ACTIVE_GENERATIONS = Number(process.env.MAX_ACTIVE_GENERATIONS) || 2;
@@ -955,6 +956,20 @@ const RESERVED_SLUGS = new Set([
   "assets",
   "cdn",
   "docs",
+  // Phase 2: reserved slug tambahan.
+  "mx",
+  "smtp",
+  "ns1",
+  "ns2",
+  "status",
+  "blog",
+  "help",
+  "support",
+  "login",
+  "register",
+  "auth",
+  "preview",
+  "publish",
 ]);
 const SUBDOMAIN_REGEX = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
@@ -966,9 +981,29 @@ const isSubdomainActive = (project) => {
   );
 };
 
+// Phase 2: lazy cleanup — unset semua subdomain yang sudah expired, supaya
+// slug lama bisa diklaim ulang. Idempotent. Tidak pakai cron dependensi.
+export async function releaseExpiredSubdomains() {
+  const now = new Date();
+  const result = await Project.updateMany(
+    {
+      customSubdomain: { $exists: true, $ne: null },
+      subdomainExpiresAt: { $lte: now },
+    },
+    {
+      $unset: { customSubdomain: 1, subdomainExpiresAt: 1 },
+      $set: { published: false },
+    },
+  );
+  return result.modifiedCount || 0;
+}
+
 export const claimSubdomain = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const owner = req.user.userId;
+
+  // Phase 2: ambil biaya & durasi dari creditCosts (jangan hardcode).
+  const { cost: subdomainCost, days: subdomainDays } = creditCosts().subdomain;
 
   const rawSlug =
     typeof req.body?.slug === "string"
@@ -999,25 +1034,23 @@ export const claimSubdomain = asyncHandler(async (req, res) => {
     );
   }
 
-  const existing = await Project.findOne({
-    customSubdomain: rawSlug,
-    subdomainExpiresAt: { $gt: new Date() },
-  }).lean();
-
-  if (existing) {
-    return fail(
-      res,
-      409,
-      "SUBDOMAIN_TAKEN",
-      {},
-      "Subdomain ini sudah dipakai orang lain.",
-    );
-  }
-
   if (!isValidId(id)) return notFound(res);
 
   const project = await Project.findOne({ _id: id, owner }).lean();
   if (!project) return notFound(res);
+
+  // Phase 2 W6: cegah overwrite. Project yang masih punya subdomain aktif
+  // harus release dulu sebelum bisa claim slug baru. Kalau subdomain miliknya
+  // sendiri sudah expired, claim slug baru tetap boleh.
+  if (isSubdomainActive(project)) {
+    return fail(
+      res,
+      409,
+      "PROJECT_HAS_SUBDOMAIN",
+      {},
+      "Project ini sudah punya subdomain aktif. Lepas dulu sebelum klaim slug baru.",
+    );
+  }
 
   if (project.status !== "completed") {
     return fail(
@@ -1029,12 +1062,51 @@ export const claimSubdomain = asyncHandler(async (req, res) => {
     );
   }
 
-  const charge = await chargeCredits(owner, SUBDOMAIN_COST);
+  // Phase 2: samakan quality gate dengan publishProject.
+  if (project.quality?.status === "failed") {
+    return fail(
+      res,
+      409,
+      "QUALITY_FAILED",
+      {},
+      "Project ini gagal quality check dan tidak bisa dipublish.",
+    );
+  }
+
+  const now = new Date();
+
+  // Cek konflik dengan subdomain aktif milik project LAIN.
+  const activeConflict = await Project.exists({
+    customSubdomain: rawSlug,
+    subdomainExpiresAt: { $gt: now },
+  });
+  if (activeConflict) {
+    return fail(
+      res,
+      409,
+      "SUBDOMAIN_TAKEN",
+      {},
+      "Subdomain ini sudah dipakai orang lain.",
+    );
+  }
+
+  // Phase 2: lepas slug expired (kalau ada) secara atomic sebelum charge.
+  // Filter menyertakan subdomainExpiresAt: { $lte: now } supaya tidak
+  // menabrak subdomain yang masih aktif. Idempotent.
+  await Project.updateOne(
+    { customSubdomain: rawSlug, subdomainExpiresAt: { $lte: now } },
+    {
+      $unset: { customSubdomain: 1, subdomainExpiresAt: 1 },
+      $set: { published: false },
+    },
+  );
+
+  const charge = await chargeCredits(owner, subdomainCost);
   if (!charge.ok) return rejectCharge(res, charge);
 
   try {
     const expiresAt = new Date();
-    expiresAt.setDate(expiresAt.getDate() + 30);
+    expiresAt.setDate(expiresAt.getDate() + subdomainDays);
 
     const updated = await Project.findByIdAndUpdate(
       id,
@@ -1048,16 +1120,21 @@ export const claimSubdomain = asyncHandler(async (req, res) => {
       { returnDocument: "after" },
     );
 
+    if (!updated) {
+      await refundCredits(owner, subdomainCost);
+      return notFound(res);
+    }
+
     res.json({
       success: true,
-      message: "Subdomain berhasil diklaim untuk 30 hari!",
+      message: `Subdomain berhasil diklaim untuk ${subdomainDays} hari!`,
       url: `https://${rawSlug}.renscraft.cyou`,
-      expiresAt: expiresAt,
+      expiresAt,
       credits: await getBalance(owner),
       project: serializeProject(updated),
     });
   } catch (err) {
-    await refundCredits(owner, SUBDOMAIN_COST);
+    await refundCredits(owner, subdomainCost);
     if (err?.code === 11000) {
       return fail(
         res,
@@ -1075,6 +1152,9 @@ export const renewSubdomain = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const owner = req.user.userId;
 
+  // Phase 2: biaya & durasi dari creditCosts.
+  const { cost: subdomainCost, days: subdomainDays } = creditCosts().subdomain;
+
   if (!isValidId(id)) return notFound(res);
 
   const project = await Project.findOne({ _id: id, owner }).lean();
@@ -1090,7 +1170,18 @@ export const renewSubdomain = asyncHandler(async (req, res) => {
     );
   }
 
-  const charge = await chargeCredits(owner, SUBDOMAIN_COST);
+  // Phase 2: quality gate sama dengan claimSubdomain & publishProject.
+  if (project.quality?.status === "failed") {
+    return fail(
+      res,
+      409,
+      "QUALITY_FAILED",
+      {},
+      "Project ini gagal quality check dan tidak bisa dipublish.",
+    );
+  }
+
+  const charge = await chargeCredits(owner, subdomainCost);
   if (!charge.ok) return rejectCharge(res, charge);
 
   try {
@@ -1099,7 +1190,7 @@ export const renewSubdomain = asyncHandler(async (req, res) => {
         ? project.subdomainExpiresAt
         : new Date();
     const newExpiresAt = new Date(baseDate);
-    newExpiresAt.setDate(newExpiresAt.getDate() + 30);
+    newExpiresAt.setDate(newExpiresAt.getDate() + subdomainDays);
 
     const updated = await Project.findByIdAndUpdate(
       id,
@@ -1107,16 +1198,21 @@ export const renewSubdomain = asyncHandler(async (req, res) => {
       { returnDocument: "after" },
     );
 
+    if (!updated) {
+      await refundCredits(owner, subdomainCost);
+      return notFound(res);
+    }
+
     res.json({
       success: true,
-      message: "Subdomain diperpanjang 30 hari!",
+      message: `Subdomain diperpanjang ${subdomainDays} hari!`,
       url: `https://${project.customSubdomain}.renscraft.cyou`,
       expiresAt: newExpiresAt,
       credits: await getBalance(owner),
       project: serializeProject(updated),
     });
   } catch (err) {
-    await refundCredits(owner, SUBDOMAIN_COST);
+    await refundCredits(owner, subdomainCost);
     throw err;
   }
 });

@@ -13,6 +13,11 @@ export const creditCosts = () => ({
   revision: intEnv("CREDIT_COST_REVISION", 3),
   exportCost: intEnv("CREDIT_COST_EXPORT", 30),
   exportCostRepeat: intEnv("CREDIT_COST_EXPORT_REPEAT", 10),
+  // Phase 2: biaya & durasi subdomain jangan hardcode di controller.
+  subdomain: {
+    cost: intEnv("CREDIT_COST_SUBDOMAIN", 100),
+    days: intEnv("SUBDOMAIN_DAYS", 30),
+  },
 });
 
 export const exportCostFor = (
@@ -55,7 +60,6 @@ export async function refundCredits(userId: string, amount: number) {
 export async function refundHeld(projectId: string) {
   try {
     const claimed = await Project.findOneAndUpdate(
-      // Property 'findOneAndUpdate' does not exist on type 'Router'.
       { _id: projectId, creditsHeld: { $gt: 0 } },
       { $set: { creditsHeld: 0 } },
       { returnDocument: "before", projection: { owner: 1, creditsHeld: 1 } },

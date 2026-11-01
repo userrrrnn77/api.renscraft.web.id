@@ -20,7 +20,10 @@ import {
 import appRouter from "./routes/index.routes.js";
 import { initWebSocket } from "./config/ws.js";
 import runtimeRouter from "./routes/runtimeRoutes.js";
-import { recoverStaleProjects } from "./controllers/projectController.js";
+import {
+  recoverStaleProjects,
+  releaseExpiredSubdomains,
+} from "./controllers/projectController.js";
 
 try {
   validateEnv();
@@ -71,7 +74,26 @@ if (process.env.NODE_ENV === "production" && trustProxy === 0) {
   } catch (err) {
     console.error(`[Boot] Recovery failed:`, err);
   }
+
+  // Phase 2: rilis subdomain yang sudah expired, sekali saat boot.
+  try {
+    const released = await releaseExpiredSubdomains();
+    console.log(`[Boot] Released ${released} expired subdomain(s)`);
+  } catch (err) {
+    console.error(`[Boot] Subdomain cleanup failed:`, err);
+  }
 })();
+
+const SUBDOMAIN_CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
+setInterval(() => {
+  releaseExpiredSubdomains()
+    .then((n) => {
+      if (n > 0) {
+        console.log(`[Subdomain] Released ${n} expired subdomain(s)`);
+      }
+    })
+    .catch((err) => console.error(`[Subdomain] Cleanup failed:`, err));
+}, SUBDOMAIN_CLEANUP_INTERVAL_MS).unref?.();
 
 // F8.1: validasi env harness AI. Warn only, jangan block boot — env
 // yang salah di sini bikin biaya tracking meleset, bukan server mati.

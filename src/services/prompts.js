@@ -1,9 +1,15 @@
-// src/services/prompts.js
+// FILE: src/services/prompts.js
 
 // --- System Prompts ---
 // All AI prompts are centralized here for easy editing and consistency.
 
 import { isDynamicAppsEnabled } from "../config/env.js";
+import {
+  buildBaseSystemV2,
+  replaceOrThrow,
+  REVISE_V2_NOTE,
+  FILE_CODE_V2,
+} from "./promptsV2.js";
 
 // Legacy base. Do not edit: byte-identical output for projects without a brief.
 const BASE_SYSTEM_LEGACY = `You are an elite Senior Frontend Developer and UI/UX Designer with deep expertise in React and Tailwind CSS. You build world-class, production-ready websites that feel like they were crafted by a top-tier design agency — with the visual quality of Stripe, Linear, Vercel, or Loom landing pages.
@@ -352,23 +358,28 @@ const BASE_SYSTEM_BRIEF = (() => {
   let s = BASE_SYSTEM_LEGACY;
 
   // 1. Remove the SaaS landing-page bullet (item 2 in intent recognition).
-  s = s.replace(
+  s = replaceOrThrow(
+    s,
     /2\. \*\*Marketing \/ Corporate \/ SaaS Websites\*\*[^\n]*\n   - [^\n]*\n\n/,
     "",
   );
 
   // 2. Remove the Pricing Cards + Testimonials blocks (they run until the
   //    Call-to-Action heading).
-  s = s.replace(
+  s = replaceOrThrow(
+    s,
     /\n### Pricing Cards\n[\s\S]*?(?=\n### Call-to-Action Section)/,
     "",
   );
 
-  // 3. Remove star-rating wording (in case any remains).
+  // 3. Remove star-rating wording (in case any remains). Plain .replace on
+  //    purpose: step 2 already drops this text, so a missing marker must
+  //    NOT be an error here.
   s = s.replace(/\s*star rating \(⭐️ or fa-star icons\),/g, ",");
 
   // 4. Add the section discipline block right before DESIGN PHILOSOPHY.
-  s = s.replace(
+  s = replaceOrThrow(
+    s,
     "---\n\n## DESIGN PHILOSOPHY",
     "---\n\n## SECTION DISCIPLINE\n\n" +
       "- Sections come only from the plan. Never add a section that is not in the plan.\n" +
@@ -377,13 +388,15 @@ const BASE_SYSTEM_BRIEF = (() => {
   );
 
   // 5. A chosen vibe overrides the default look.
-  s = s.replace(
+  s = replaceOrThrow(
+    s,
     "---\n\n## 1. TYPOGRAPHY",
     STYLE_OVERRIDE_BLOCK + "---\n\n## 1. TYPOGRAPHY",
   );
 
   // 6. "Gelap & techy" counts as an explicit dark theme request.
-  s = s.replace(
+  s = replaceOrThrow(
+    s,
     "(or a dark/light toggle) in their prompt.",
     '(or a dark/light toggle) in their prompt, or when the brief\'s chosen style is "Gelap & techy".',
   );
@@ -391,7 +404,15 @@ const BASE_SYSTEM_BRIEF = (() => {
   return s;
 })();
 
+const BASE_SYSTEM_BRIEF_V2 = buildBaseSystemV2(BASE_SYSTEM_LEGACY);
+
+// Read at call time (not import time) so tests/dev servers can flip the flag.
+function promptV2(hasBrief) {
+  return Boolean(hasBrief) && process.env.PROMPT_V2 === "1";
+}
+
 export function buildBase({ hasBrief } = {}) {
+  if (promptV2(hasBrief)) return BASE_SYSTEM_BRIEF_V2;
   return hasBrief ? BASE_SYSTEM_BRIEF : BASE_SYSTEM_LEGACY;
 }
 
@@ -506,15 +527,18 @@ export const FILE_PLAN_SYSTEM = `${BASE_SYSTEM_LEGACY}${FILE_PLAN_SYSTEM_BODY}`;
 export const REVISE_SYSTEM = `${BASE_SYSTEM_LEGACY}${REVISE_SYSTEM_BODY}`;
 
 export function buildFilePlanSystem({ hasBrief } = {}) {
-  const base = hasBrief
-    ? `${BASE_SYSTEM_BRIEF}${FILE_PLAN_SYSTEM_BODY}${BRIEF_PLANNER_RULES}`
-    : FILE_PLAN_SYSTEM;
+  const base = promptV2(hasBrief)
+    ? `${BASE_SYSTEM_BRIEF_V2}${FILE_PLAN_SYSTEM_BODY}${BRIEF_PLANNER_RULES}`
+    : hasBrief
+      ? `${BASE_SYSTEM_BRIEF}${FILE_PLAN_SYSTEM_BODY}${BRIEF_PLANNER_RULES}`
+      : FILE_PLAN_SYSTEM;
 
   return isDynamicAppsEnabled() ? `${base}${DATA_SPEC_PLAN_LINE}` : base;
 }
 export function buildReviseSystem({ hasBrief } = {}) {
   if (!hasBrief) return REVISE_SYSTEM;
-  return `${BASE_SYSTEM_BRIEF}${REVISE_SYSTEM_BODY}`;
+  const base = `${BASE_SYSTEM_BRIEF}${REVISE_SYSTEM_BODY}`;
+  return promptV2(hasBrief) ? `${base}${REVISE_V2_NOTE}` : base;
 }
 
 export function buildFileCodeSystem(
@@ -545,9 +569,15 @@ export function buildFileCodeSystem(
     }
   }
 
-  const designRule = hasBrief
-    ? "Apply the design system defined in the base instructions, except where the brief's chosen style (Arahan gaya) overrides it"
-    : "Apply the full design system defined in the base instructions — premium typography, generous spacing, proper hover effects, and animations";
+  const designRule = promptV2(hasBrief)
+    ? FILE_CODE_V2.designRule
+    : hasBrief
+      ? "Apply the design system defined in the base instructions, except where the brief's chosen style (Arahan gaya) overrides it"
+      : "Apply the full design system defined in the base instructions — premium typography, generous spacing, proper hover effects, and animations";
+
+  const stylesRule = promptV2(hasBrief)
+    ? FILE_CODE_V2.stylesRule
+    : "The /styles.css file MUST include: Google Font @import, @keyframes float/fadeInUp/fadeIn, and .animate-* utility classes";
 
   return `${base}
 
@@ -567,6 +597,6 @@ Rules:
 - Do NOT include any other files
 - The code must be complete, visually stunning, and production-ready
 - Import other project files using their exact paths (e.g. import Header from './components/Header')
-- The /styles.css file MUST include: Google Font @import, @keyframes float/fadeInUp/fadeIn, and .animate-* utility classes
-- Apply the design system defined in the base instructions, except where the brief's chosen style (Arahan gaya) overrides it${contractText ? `\n\n${contractText}` : ""}`;
+- ${stylesRule}
+- ${designRule}${contractText ? `\n\n${contractText}` : ""}`;
 }

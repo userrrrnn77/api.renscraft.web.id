@@ -1,4 +1,4 @@
-// services/brief/briefContext.js
+// FILE: src/services/brief/briefContext.js
 //
 // Layer 3: mengubah snapshot brief jadi (a) blok teks untuk prompt model dan
 // (b) override contract.facts. Pure, tanpa I/O.
@@ -46,6 +46,7 @@ function renderFilled(def, value, maxLines) {
 }
 
 function renderBlock(snapshot, maxLines) {
+  const promptV2 = process.env.PROMPT_V2 === "1";
   const cat = getCategory(snapshot.category);
   const answers = snapshot.answers ?? {};
   // Snapshot baru punya slots[]; snapshot lama fallback ke katalog.
@@ -101,13 +102,23 @@ function renderBlock(snapshot, maxLines) {
   if (styleSlot) {
     const vibe = valueOf(answers, "vibe");
     out.push("\n### Gaya tampilan");
-    out.push(vibe ?? "Tidak ditentukan — kamu bebas memilih");
+    out.push(
+      vibe ??
+        (promptV2
+          ? "Tidak ditentukan — ikuti blok Design system di PROJECT CONTRACT."
+          : "Tidak ditentukan — kamu bebas memilih"),
+    );
     const hint = vibeHint(vibe);
     if (hint) {
       out.push(
         `Arahan gaya (WAJIB diikuti, menimpa gaya default atau preferensi estetika lain): ${hint}`,
       );
     }
+  }
+
+  if (promptV2 && cat.heroHint) {
+    out.push("\n### Arahan hero");
+    out.push(cat.heroHint);
   }
 
   const rules = [

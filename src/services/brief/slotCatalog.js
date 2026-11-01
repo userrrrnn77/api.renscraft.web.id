@@ -1,4 +1,4 @@
-// services/brief/slotCatalog.js
+// FILE: src/services/brief/slotCatalog.js
 //
 // Katalog "slot" = data yang TIDAK boleh dikarang AI. Dua grup:
 //   fact  -> nama, alamat, kontak, harga, jam, menu, data project. Kosong = placeholder.
@@ -282,6 +282,8 @@ export const CATEGORIES = [
     id: "kuliner",
     label: "Kuliner",
     hint: "warkop, cafe, restoran, warung, katering, toko kue, bakery",
+    heroHint:
+      "Hero: nama usaha besar + 1 kalimat suasana + jam buka + tombol WhatsApp. Tonjolkan best seller bila ada.",
     slots: [
       "brand_name",
       "menu",
@@ -297,6 +299,8 @@ export const CATEGORIES = [
     id: "portfolio",
     label: "Portfolio",
     hint: "portfolio / CV online / personal website developer, desainer, fotografer, freelancer",
+    heroHint:
+      "Hero: nama besar, profesi, 1 kalimat bio, 2 link (project, kontak). Tanpa foto stok orang.",
     slots: [
       "brand_name",
       "profesi",
@@ -314,6 +318,8 @@ export const CATEGORIES = [
     id: "jasa",
     label: "Jasa / Layanan",
     hint: "bengkel, salon, laundry, les privat, fotografi, konsultan, kontraktor, klinik",
+    heroHint:
+      "Hero: layanan utama + area layanan + tombol WhatsApp. Harga 'mulai dari' hanya bila ada di brief.",
     slots: [
       "brand_name",
       "layanan",
@@ -328,6 +334,8 @@ export const CATEGORIES = [
     id: "event",
     label: "Event / Undangan",
     hint: "undangan pernikahan, ulang tahun, seminar, reuni, acara komunitas",
+    heroHint:
+      "Hero: nama acara/mempelai sangat besar + tanggal + lokasi + tombol RSVP.",
     slots: [
       "brand_name",
       "tanggal",
@@ -342,12 +350,15 @@ export const CATEGORIES = [
     id: "artikel",
     label: "Artikel / Blog",
     hint: "artikel, blog, berita, tulisan, halaman edukasi",
+    heroHint:
+      "Hero: judul artikel berukuran editorial + penulis. Tanpa gambar hero. Lebar baca maksimal 70ch.",
     slots: ["brand_name", "isi_artikel", "penulis", "topik", "vibe"],
   },
   {
     id: "brosur",
     label: "Brosur online",
     hint: "brosur, company profile satu halaman, flyer digital, katalog singkat",
+    heroHint: "Hero: profil singkat + penawaran utama + promo bila ada.",
     slots: [
       "brand_name",
       "profil_singkat",
@@ -364,6 +375,7 @@ export const CATEGORIES = [
     id: "app_tool",
     label: "Aplikasi / Game / Tool",
     hint: "game, kalkulator, todo app, timer, converter, quiz",
+    heroHint: "Tanpa hero marketing: aplikasi langsung jadi tampilan utama.",
     slots: [],
   },
   {
@@ -371,6 +383,8 @@ export const CATEGORIES = [
     id: "dashboard",
     label: "Dashboard (demo)",
     hint: "dashboard, panel admin, laporan statistik",
+    heroHint:
+      "Header ringkas + kartu ringkasan + label DATA CONTOH yang jelas.",
     slots: [],
     sampleData: true,
   },
@@ -378,6 +392,8 @@ export const CATEGORIES = [
     id: "toko_produk",
     label: "Toko / Produk",
     hint: "toko online, katalog produk, warung sembako, toko kelontong, toko bahan pokok, bouquet, fashion, kerajinan, jualan barang",
+    heroHint:
+      "Hero: nama toko + jenis produk + cara order. Produk unggulan langsung terlihat.",
     slots: [
       "brand_name",
       "produk",
@@ -392,6 +408,7 @@ export const CATEGORIES = [
     id: "lainnya",
     label: "Lainnya",
     hint: "semua yang tidak cocok dengan kategori lain",
+    heroHint: "Hero: nama + satu kalimat apa yang ditawarkan + satu CTA utama.",
     slots: ["brand_name", "whatsapp", "address", "vibe"],
   },
 ];

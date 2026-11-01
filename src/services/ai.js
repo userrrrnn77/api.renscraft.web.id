@@ -1,4 +1,4 @@
-// src/services/ai.js
+// FILE: src/services/ai.js
 
 import path from "node:path";
 import { createOpenAI } from "@ai-sdk/openai";
@@ -56,6 +56,8 @@ import {
   triggerDownloads,
 } from "./stockImages.js";
 import { buildFactContext } from "./contract/factContext.js";
+import { injectDesignTokens } from "./contract/designTokens.js";
+import { designFromBrief } from "./brief/vibePresets.js";
 
 // Update juga AI_PRICE_IN_PER_M / AI_PRICE_OUT_PER_M biar tracker biaya akurat.
 const MODEL = process.env.AI_MODEL || "deepseek-v4.1-flash";
@@ -757,6 +759,12 @@ export async function generateProject(prompt, callbacks, options = {}) {
 
   if (options.brief) {
     contract.facts = mergeBriefFacts(contract.facts, options.brief, prompt);
+    if (process.env.PROMPT_V2 === "1") {
+      const design = designFromBrief(options.brief, prompt);
+      if (design) {
+        contract.design = design;
+      }
+    }
   }
 
   if (callbacks?.onPlan) {
@@ -1050,6 +1058,7 @@ export async function generateProject(prompt, callbacks, options = {}) {
   try {
     const style = await fixStylesheets(finalFiles);
     finalFiles = style.files;
+    finalFiles = injectDesignTokens(finalFiles, contract);
     const rewritten = Object.keys(style.fixed).length;
     const problems = style.notes.filter((n) =>
       /failed|crashed|does not parse/.test(n),
@@ -1231,6 +1240,7 @@ export async function generateProject(prompt, callbacks, options = {}) {
       try {
         const style = await fixStylesheets(finalFiles);
         finalFiles = style.files;
+        finalFiles = injectDesignTokens(finalFiles, contract);
       } catch (err) {
         console.warn("[Styles] post-repair failed:", err);
       }
