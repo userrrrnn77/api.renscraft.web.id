@@ -25,7 +25,6 @@ import { asyncHandler } from "../utils/asyncHandler.js";
 import { fail } from "../utils/apiError.js";
 import { buildQualityReport } from "../services/quality.js";
 import { createHeartbeat } from "../services/heartbeat.js";
-import { runQualityGate } from "../services/qa/qualityGate.js";
 
 const MAX_PROMPT_LENGTH = 4000;
 const MAX_ACTIVE_GENERATIONS = Number(process.env.MAX_ACTIVE_GENERATIONS) || 2;
@@ -492,6 +491,7 @@ const runBackgroundGeneration = async (projectId, prompt, brief = null) => {
 
     // F3: bawa issue dari finalize (blocking/warning, sudah berbentuk
     // QualityIssue) ke QualityReport supaya F1 bisa gate publish/export.
+    // F3: issue dari finalize
     if (Array.isArray(result.finalizeIssues)) {
       for (const i of result.finalizeIssues) {
         qualityIssues.push({
@@ -528,47 +528,8 @@ const runBackgroundGeneration = async (projectId, prompt, brief = null) => {
       );
     }
 
-    // F5: bawa issue dari QA gate. Di mode "shadow", pemanggil sudah memastikan
-    // ── F5: QA gate ──────────────────────────────────────────────────────
-    let gateIssues = [];
-    let gateStages = {};
-    let gateMode = "off";
-    try {
-      const gate = await runQualityGate(finalFiles, contract);
-      gateMode = gate.mode;
-      gateStages = gate.stages;
-      gateIssues = gate.reportable ? gate.issues : [];
-
-      const fmt = (i) =>
-        `${i.code}${i.path ? ` @ ${i.path}` : ""}: ${i.message}`;
-
-      if (gate.mode === "shadow") {
-        // Shadow: cuma blocking yang di-log. Warning (RESOURCE_BLOCKED, dll)
-        // diabaikan — kalau nanti di-enforce pun gak akan ngeblok.
-        if (gate.loggable.length > 0) {
-          console.log(
-            `[QA] shadow: ${gate.loggable.length} blocking issue(s) (not applied):\n  - ` +
-              gate.loggable.map(fmt).join("\n  - "),
-          );
-        } else if (gate.issues.length > 0) {
-          console.log(
-            `[QA] shadow: passed (${gate.issues.length} warning(s) ignored)`,
-          );
-        } else {
-          console.log(`[QA] shadow: passed`);
-        }
-      } else if (gate.issues.length === 0) {
-        console.log(`[QA] ${gate.mode}: passed`);
-      } else {
-        const blocking = gate.issues.filter((i) => i.severity === "blocking");
-        console.log(
-          `[QA] ${gate.mode}: ${gate.issues.length} issue(s), ${blocking.length} blocking:\n  - ` +
-            gate.issues.map(fmt).join("\n  - "),
-        );
-      }
-    } catch (err) {
-      console.error("[QA] crashed, skipping gate:", err);
-    }
+    // F5: QA gate sudah jalan di generateProject (ai.js), tinggal bawa hasilnya.
+    qualityIssues.push(...(result.gateIssues ?? []));
 
     const quality = buildQualityReport(qualityIssues, { version: 1 });
 

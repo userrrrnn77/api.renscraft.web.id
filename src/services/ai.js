@@ -1281,6 +1281,7 @@ export async function generateProject(prompt, callbacks, options = {}) {
     gateIssues,
     gateStages,
     gateMode,
+    contract, // gini bre?
   };
 }
 
