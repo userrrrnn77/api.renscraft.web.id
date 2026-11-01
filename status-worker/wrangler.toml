@@ -1,0 +1,18 @@
+name = "renscraft-status"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "renscraft-status"
+database_id = "72261d89-af64-41f6-a79a-6074a8c0cb39"
+
+[vars]
+WEBSITE_URL = "https://renscraft.web.id"
+API_HEALTH_URL = "https://api.renscraft.web.id/api/health"
+PUBLISHED_PROBE_URL = ""
+ALLOWED_ORIGINS = "https://renscraft.web.id,https://www.renscraft.web.id,http://localhost:5173"
+TZ_OFFSET_MINUTES = "420"

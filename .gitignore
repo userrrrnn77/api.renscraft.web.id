@@ -27,3 +27,12 @@ dist-ssr
 # Environment & Secrets
 .env
 midtrans.txt
+
+# Cloudflare Workers
+.wrangler/
+.dev.vars
+.dev.vars.*
+
+.env
+.env.*
+!.env.example

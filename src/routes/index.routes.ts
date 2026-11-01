@@ -1,4 +1,5 @@
 import { Router } from "express";
+import healthRouter from "./healthRoutes.js";
 import authRouter from "./authRoutes.js";
 import briefRouter from "./briefRoutes.js";
 import paymentRoutes from "./paymentRoutes.js";
@@ -10,6 +11,7 @@ import dynamicRouter from "./dynamicRoutes.js";
 
 const appRouter = Router();
 
+appRouter.use("/health", healthRouter);
 appRouter.use("/auth", authRouter);
 appRouter.use("/briefs", briefRouter);
 appRouter.use("/projects", projectRouter);
