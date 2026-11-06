@@ -649,9 +649,13 @@ export async function generateProject(prompt, callbacks, options = {}) {
   const briefBlock = options.brief ? buildBriefBlock(options.brief) : "";
   const hasBrief = Boolean(options.brief);
 
+  // Inspiration by default; only explicit "remake" opts into full content.
+  const refMode = options.refMode === "remake" ? "remake" : "inspiration";
+
   const initialRefs = await buildReferenceContext(prompt, [], {
     mirror: mirrorImages,
     extraAssets: uploadedAssets,
+    mode: refMode,
   });
 
   const initialAiPrompt = [prompt, initialRefs.context, briefBlock]
@@ -660,7 +664,7 @@ export async function generateProject(prompt, callbacks, options = {}) {
 
   if (initialRefs.context) {
     console.log(
-      `[AI] Phase 0: reference context added (${initialRefs.context.length} chars, ${initialRefs.assets.length} images)`,
+      `[AI] Phase 0: reference context added (${initialRefs.context.length} chars, ${initialRefs.assets.length} images, mode=${refMode})`,
     );
   }
 
@@ -710,11 +714,12 @@ export async function generateProject(prompt, callbacks, options = {}) {
     const rebuilt = await buildReferenceContext(prompt, [], {
       mirror: mirrorImages,
       extraAssets: [...uploadedAssets, ...stockAssets],
+      mode: refMode,
     });
     referenceContext = rebuilt.context;
     assets = rebuilt.assets;
     console.log(
-      `[AI] Phase 1.6: context rebuilt with Unsplash (${assets.length} total images)`,
+      `[AI] Phase 1.6: context rebuilt with Unsplash (${assets.length} total images, mode=${refMode})`,
     );
   }
 
@@ -897,8 +902,6 @@ export async function generateProject(prompt, callbacks, options = {}) {
       if (ext === "css") {
         files[key] = `/* ${purpose} - generation failed, please retry */\n`;
       } else {
-        // F8.3: placeholder mengikuti contract (named vs default export yang
-        // diharapkan importer) supaya bundle tidak pecah.
         const exp = parseExports(file.exports, file.path);
         const baseName =
           file.path
@@ -971,8 +974,6 @@ export async function generateProject(prompt, callbacks, options = {}) {
 
   if (process.env.HARNESS_FACT_GUARD !== "0" && FACT_GUARD_MAX_FILES > 0) {
     try {
-      // F7: satu sumber fakta, jalan untuk semua project (brief maupun tidak).
-      // Project tanpa brief = sumber dari prompt + refs + contract.facts.
       const factCtx = buildFactContext({
         prompt,
         brief: options.brief ?? null,
@@ -1082,7 +1083,6 @@ export async function generateProject(prompt, callbacks, options = {}) {
     );
   }
 
-  // ── F3: finalize step ────────────────────────────────────────────────
   let finalizeIssues = [];
   if (process.env.HARNESS_FINAL_REVALIDATE !== "0") {
     try {
@@ -1108,9 +1108,6 @@ export async function generateProject(prompt, callbacks, options = {}) {
     }
   }
 
-  // ── F5: QA gate ──────────────────────────────────────────────────────
-  // WAJIB di function scope: ketiga variabel ini dipakai di return statement.
-  // ── F5: QA gate + diagnostic repair loop (F5.6) ──────────────────────
   let gateIssues = [];
   let gateStages = {};
   let gateMode = "off";
@@ -1162,21 +1159,18 @@ export async function generateProject(prompt, callbacks, options = {}) {
         );
       }
 
-      // Repair hanya di mode enforce
       if (gate.mode !== "enforce") break;
       if (round >= MAX_REPAIR) break;
 
       const blocking = gate.issues.filter((i) => i.severity === "blocking");
       if (blocking.length === 0) break;
 
-      // Budget guard
       const budget = getBudgetSummary();
       if (budget?.exceeded) {
         console.warn(`[QA] budget exceeded, stopping repair`);
         break;
       }
 
-      // Group blocking by path
       const byPath = new Map();
       for (const issue of blocking) {
         const p = issue.path;
@@ -1226,8 +1220,6 @@ export async function generateProject(prompt, callbacks, options = {}) {
         }
       }
 
-      // Setelah repair: re-finalize + re-stylesheet, lalu loop akan
-      // menjalankan gate lagi.
       if (process.env.HARNESS_FINAL_REVALIDATE !== "0") {
         try {
           const fin = await finalizeProject(finalFiles, contract);
@@ -1247,7 +1239,6 @@ export async function generateProject(prompt, callbacks, options = {}) {
     }
   }
 
-  // Unsplash download
   if (stockAssets.length > 0) {
     const accessKey = process.env.UNSPLASH_ACCESS_KEY;
     for (const asset of stockAssets) {
@@ -1281,7 +1272,7 @@ export async function generateProject(prompt, callbacks, options = {}) {
     gateIssues,
     gateStages,
     gateMode,
-    contract, // gini bre?
+    contract,
   };
 }
 

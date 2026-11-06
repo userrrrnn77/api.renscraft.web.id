@@ -25,6 +25,7 @@ import { asyncHandler } from "../utils/asyncHandler.js";
 import { fail } from "../utils/apiError.js";
 import { buildQualityReport } from "../services/quality.js";
 import { createHeartbeat } from "../services/heartbeat.js";
+import { hostKey, pageUrlsOf } from "../utils/referenceUrls.js";
 
 const MAX_PROMPT_LENGTH = 4000;
 const MAX_ACTIVE_GENERATIONS = Number(process.env.MAX_ACTIVE_GENERATIONS) || 2;
@@ -124,6 +125,28 @@ export const filesToObject = (files) => {
   return obj;
 };
 
+// Hitung remakeOf + remakeConsent dari brief. Kosong kalau bukan remake.
+const computeRemakeMeta = (briefLike) => {
+  if (
+    !briefLike ||
+    briefLike.refMode !== "remake" ||
+    !briefLike.refConsent?.accepted
+  ) {
+    return { remakeOf: [], remakeConsent: null };
+  }
+  const pages = pageUrlsOf(briefLike.prompt ?? "").slice(0, 5);
+  const domains = [...new Set(pages.map(hostKey).filter(Boolean))].slice(0, 5);
+  if (domains.length === 0) return { remakeOf: [], remakeConsent: null };
+  return {
+    remakeOf: domains,
+    remakeConsent: {
+      at: briefLike.refConsent.at ?? new Date(),
+      ipHash: briefLike.refConsent.ipHash ?? "",
+      urls: pages,
+    },
+  };
+};
+
 export const serializeProject = (project) => ({
   _id: project._id,
   name: project.name,
@@ -145,8 +168,9 @@ export const serializeProject = (project) => ({
   exportCost: exportCostFor(project.firstExportAt),
   createdAt: project.createdAt,
   updatedAt: project.updatedAt,
-  // F1: QualityReport. null untuk project lama yang belum pernah dinilai.
   quality: project.quality ?? null,
+  // Hanya remakeOf, JANGAN remakeConsent.
+  remakeOf: project.remakeOf ?? [],
 });
 
 const notFound = (
@@ -194,11 +218,6 @@ const settleIfStale = async (project) => {
 };
 
 // ─── F2: recovery saat boot ────────────────────────────────────────────────
-//
-// Panggil dari server.js SETELAH DB ready. Menyelesaikan project yang
-// nyangkut di busy karena proses sebelumnya mati (deploy / pm2 restart).
-// Idempotent: filter updatedAt < cutoff mencegah dua instance mem-settle
-// project yang sama.
 export async function recoverStaleProjects(graceMs = 120_000) {
   const cutoff = new Date(Date.now() - graceMs);
   const stuck = await Project.find({
@@ -313,6 +332,8 @@ export const createProject = asyncHandler(async (req, res) => {
   }
 
   let snapshot = null;
+  let remakeOf = [];
+  let remakeConsent = null;
   if (briefDoc) {
     let claimed;
     try {
@@ -329,7 +350,9 @@ export const createProject = asyncHandler(async (req, res) => {
       await refundCredits(owner, cost);
       return fail(res, 409, "PROJECT_BRIEF_USED", {}, "Brief sudah dipakai");
     }
-    snapshot = toSnapshot(claimed.toObject());
+    const claimedObj = claimed.toObject();
+    snapshot = toSnapshot(claimedObj);
+    ({ remakeOf, remakeConsent } = computeRemakeMeta(claimedObj));
   }
 
   let project;
@@ -352,6 +375,8 @@ export const createProject = asyncHandler(async (req, res) => {
       errorCode: null,
       creditsHeld: cost,
       brief: snapshot,
+      remakeOf,
+      remakeConsent,
     });
   } catch (err) {
     await refundCredits(owner, cost);
@@ -398,9 +423,11 @@ const runBackgroundGeneration = async (projectId, prompt, brief = null) => {
     console.log(`[Background AI] Starting generation for project ${projectId}`);
 
     const projectForUploads = await Project.findById(projectId)
-      .select("uploadedImages")
+      .select("uploadedImages remakeOf")
       .lean();
     const uploadedImages = projectForUploads?.uploadedImages || [];
+    const projectRemakeOf = projectForUploads?.remakeOf || [];
+    const refMode = projectRemakeOf.length > 0 ? "remake" : "inspiration";
 
     const result = await generateProject(
       prompt,
@@ -452,18 +479,14 @@ const runBackgroundGeneration = async (projectId, prompt, brief = null) => {
             savedPaths.add(key);
           }),
       },
-      { brief: brief ?? undefined, uploadedImages },
+      { brief: brief ?? undefined, uploadedImages, refMode },
     );
 
-    // Pastikan semua write dari onFileComplete selesai sebelum kita baca state
     await writeQueue;
 
-    // Baca state terkini (bukan snapshot lama). .lean() biar murah dan nggak
-    // ada method Mongoose yang bisa mengubah objek di memori.
     const project = await Project.findById(projectId).lean();
     if (!project) return;
 
-    // Clone, jangan mutasi objek hasil .lean()
     const mergedFiles = { ...(project.files || {}) };
     const failedPaths = [];
 
@@ -480,7 +503,6 @@ const runBackgroundGeneration = async (projectId, prompt, brief = null) => {
       if (!savedPaths.has(key)) failedPaths.push(key);
     }
 
-    // ─── F1: placeholder → warning ──────────────────────────────────────
     const qualityIssues = failedPaths.map((path) => ({
       code: "PLACEHOLDER_FILE",
       severity: "warning",
@@ -489,9 +511,6 @@ const runBackgroundGeneration = async (projectId, prompt, brief = null) => {
       message: `${path} was not generated and was replaced with a placeholder.`,
     }));
 
-    // F3: bawa issue dari finalize (blocking/warning, sudah berbentuk
-    // QualityIssue) ke QualityReport supaya F1 bisa gate publish/export.
-    // F3: issue dari finalize
     if (Array.isArray(result.finalizeIssues)) {
       for (const i of result.finalizeIssues) {
         qualityIssues.push({
@@ -505,7 +524,6 @@ const runBackgroundGeneration = async (projectId, prompt, brief = null) => {
       }
     }
 
-    // F4: budget / semaphore
     if (result.budgetExceeded) {
       qualityIssues.push({
         code: "BUDGET_EXCEEDED",
@@ -528,7 +546,6 @@ const runBackgroundGeneration = async (projectId, prompt, brief = null) => {
       );
     }
 
-    // F5: QA gate sudah jalan di generateProject (ai.js), tinggal bawa hasilnya.
     qualityIssues.push(...(result.gateIssues ?? []));
 
     const quality = buildQualityReport(qualityIssues, { version: 1 });
@@ -538,11 +555,6 @@ const runBackgroundGeneration = async (projectId, prompt, brief = null) => {
         ? "Website generation complete! You can view and edit files"
         : `Website generated, but ${failedPaths.length} file(s) could not be generated and were replaced with placeholders: ${failedPaths.join(", ")}. Ask the AI to rewrite them.`;
 
-    // ─── F2: CAS save — jangan pernah nimpa project yang sudah di-settle ──
-    // Filter { status: "generating" } memastikan:
-    //   - settleIfStale sudah menandai failed → CAS tidak match, hasil dibuang
-    //   - pm2 restart lalu recovery boot menandai failed → CAS tidak match
-    //   - 2 instance paralel → cuma satu yang menang
     const settled = await Project.findOneAndUpdate(
       { _id: projectId, status: "generating" },
       {
@@ -705,7 +717,6 @@ export const updateProjectFiles = asyncHandler(async (req, res) => {
 export const publishProject = asyncHandler(async (req, res) => {
   if (!isValidId(req.params.id)) return notFound(res);
 
-  // F1: blokir kalau quality check sudah menandai failed
   const existing = await Project.findOne({
     _id: req.params.id,
     owner: req.user.userId,
@@ -792,6 +803,7 @@ export const getPublicProject = asyncHandler(async (req, res) => {
     name: project.name,
     files: filesToObject(project.files),
     version: project.version,
+    remakeOf: project.remakeOf ?? [],
   });
 });
 
@@ -917,7 +929,6 @@ const RESERVED_SLUGS = new Set([
   "assets",
   "cdn",
   "docs",
-  // Phase 2: reserved slug tambahan.
   "mx",
   "smtp",
   "ns1",
@@ -942,8 +953,6 @@ const isSubdomainActive = (project) => {
   );
 };
 
-// Phase 2: lazy cleanup — unset semua subdomain yang sudah expired, supaya
-// slug lama bisa diklaim ulang. Idempotent. Tidak pakai cron dependensi.
 export async function releaseExpiredSubdomains() {
   const now = new Date();
   const result = await Project.updateMany(
@@ -963,7 +972,6 @@ export const claimSubdomain = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const owner = req.user.userId;
 
-  // Phase 2: ambil biaya & durasi dari creditCosts (jangan hardcode).
   const { cost: subdomainCost, days: subdomainDays } = creditCosts().subdomain;
 
   const rawSlug =
@@ -1000,9 +1008,6 @@ export const claimSubdomain = asyncHandler(async (req, res) => {
   const project = await Project.findOne({ _id: id, owner }).lean();
   if (!project) return notFound(res);
 
-  // Phase 2 W6: cegah overwrite. Project yang masih punya subdomain aktif
-  // harus release dulu sebelum bisa claim slug baru. Kalau subdomain miliknya
-  // sendiri sudah expired, claim slug baru tetap boleh.
   if (isSubdomainActive(project)) {
     return fail(
       res,
@@ -1023,7 +1028,6 @@ export const claimSubdomain = asyncHandler(async (req, res) => {
     );
   }
 
-  // Phase 2: samakan quality gate dengan publishProject.
   if (project.quality?.status === "failed") {
     return fail(
       res,
@@ -1036,7 +1040,6 @@ export const claimSubdomain = asyncHandler(async (req, res) => {
 
   const now = new Date();
 
-  // Cek konflik dengan subdomain aktif milik project LAIN.
   const activeConflict = await Project.exists({
     customSubdomain: rawSlug,
     subdomainExpiresAt: { $gt: now },
@@ -1051,9 +1054,6 @@ export const claimSubdomain = asyncHandler(async (req, res) => {
     );
   }
 
-  // Phase 2: lepas slug expired (kalau ada) secara atomic sebelum charge.
-  // Filter menyertakan subdomainExpiresAt: { $lte: now } supaya tidak
-  // menabrak subdomain yang masih aktif. Idempotent.
   await Project.updateOne(
     { customSubdomain: rawSlug, subdomainExpiresAt: { $lte: now } },
     {
@@ -1113,7 +1113,6 @@ export const renewSubdomain = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const owner = req.user.userId;
 
-  // Phase 2: biaya & durasi dari creditCosts.
   const { cost: subdomainCost, days: subdomainDays } = creditCosts().subdomain;
 
   if (!isValidId(id)) return notFound(res);
@@ -1131,7 +1130,6 @@ export const renewSubdomain = asyncHandler(async (req, res) => {
     );
   }
 
-  // Phase 2: quality gate sama dengan claimSubdomain & publishProject.
   if (project.quality?.status === "failed") {
     return fail(
       res,
@@ -1235,6 +1233,7 @@ export const getPublicProjectBySubdomain = asyncHandler(async (req, res) => {
     name: project.name,
     files: filesToObject(project.files),
     version: project.version,
+    remakeOf: project.remakeOf ?? [],
   });
 });
 
@@ -1266,7 +1265,6 @@ export const exportProject = asyncHandler(async (req, res) => {
     return;
   }
 
-  // Atomic: cuma set kalau memang belum pernah export.
   if (isFirstExport) {
     await Project.updateOne(
       { _id: id, owner, firstExportAt: null },
@@ -1279,6 +1277,8 @@ export const exportProject = asyncHandler(async (req, res) => {
     credits: charge.balance,
     cost,
     firstExport: isFirstExport,
+    // Dipakai klien + endpoint download untuk menyertakan watermark.
+    remakeOf: project.remakeOf ?? [],
     message: isFirstExport
       ? `Export pertama: ${cost} kredit. Export berikutnya cuma ${creditCosts().exportCostRepeat} kredit.`
       : `Berhasil memotong ${cost} kredit untuk export.`,
@@ -1332,8 +1332,6 @@ export const restoreProjectVersion = asyncHandler(async (req, res) => {
     return fail(res, 404, "VERSION_NOT_FOUND", {}, "Version not found");
   }
 
-  // Restore = buat versi baru dengan isi snapshot. Non-destruktif: versi
-  // lama tetap ada (bisa restore balik ke versi yang tadi).
   const newVersion = project.version + 1;
   await saveProjectVersion({
     projectId: project._id,

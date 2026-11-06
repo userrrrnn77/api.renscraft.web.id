@@ -219,6 +219,11 @@ const runBackgroundRevision = async (project, prompt) => {
 
     const briefSnapshot = project.brief?.toObject?.() ?? project.brief ?? null;
 
+    // Remake hanya kalau project ditandai remake. Project lain = inspiration
+    // (hanya design tokens, tidak ada teks/gambar yang disalin).
+    const refMode =
+      (project.remakeOf ?? []).length > 0 ? "remake" : "inspiration";
+
     const result = await reviseProject(
       prompt,
       manifest,
@@ -230,6 +235,7 @@ const runBackgroundRevision = async (project, prompt) => {
         brief: briefSnapshot,
         concept: project.description,
         scope,
+        refMode,
       },
     );
 
@@ -357,9 +363,6 @@ const runBackgroundRevision = async (project, prompt) => {
       }
     }
 
-    // ── F6.1: QA gate untuk revisi ──────────────────────────────────────
-    // Static + Bundle; Render opsional via REVISION_QA_RENDER.
-    // Blocking issue di mode "enforce" append ke `errors` → atomic abort.
     let revisionGateMode = "off";
     let revisionGateIssues = [];
     let revisionGateStages = {};
@@ -412,15 +415,10 @@ const runBackgroundRevision = async (project, prompt) => {
       }
     }
 
-    // ── F6: atomic decision ─────────────────────────────────────────────
     const atomicMode = process.env.HARNESS_REVISION_ATOMIC !== "0";
     const atomicAbort = atomicMode && !nothingApplied && errors.length > 0;
     const shouldCommit = !nothingApplied && !atomicAbort;
 
-    // ── Files yang benar-benar tersentuh revisi ini ─────────────────────
-    // Dipakai oleh Fact Guard (C1) dan vague-claims check (F7) di bawah.
-    // HARUS di scope luar (bukan di dalam try) supaya dua blok try bisa
-    // mengaksesnya tanpa ReferenceError.
     const touchedPaths = new Set();
     for (const op of result.operations || []) {
       if (op.path) touchedPaths.add(op.path);
@@ -434,7 +432,6 @@ const runBackgroundRevision = async (project, prompt) => {
     let newQuality = null;
 
     if (shouldCommit) {
-      // F5.8: simpan hasil gate revisi ke QualityReport
       if (revisionGateMode !== "off") {
         newQuality = buildQualityReport(
           revisionGateIssues.map((i) => ({
@@ -454,7 +451,6 @@ const runBackgroundRevision = async (project, prompt) => {
       );
     }
 
-    // C1: fact guard log-only (existing behaviour)
     if (
       process.env.HARNESS_FACT_GUARD !== "0" &&
       shouldCommit &&
@@ -555,7 +551,6 @@ const runBackgroundRevision = async (project, prompt) => {
       }
     }
 
-    // F7: vague claims → warning. Nggak blocking.
     if (
       process.env.HARNESS_FACT_GUARD !== "0" &&
       process.env.HARNESS_FACT_GUARD_REVISION !== "0"
@@ -611,13 +606,12 @@ const runBackgroundRevision = async (project, prompt) => {
     if (shouldCommit) {
       $set.files = finalFiles;
       $set.version = newVersion;
-      $set.creditsHeld = 0; // kredit terpakai, jangan di-refund
+      $set.creditsHeld = 0;
       if (newQuality) $set.quality = newQuality;
     } else if (healed) {
-      $set.files = project.files; // heal entity newline tetap tersimpan
+      $set.files = project.files;
     }
 
-    // CAS: kalau sudah di-settle dari luar (stale/recovery), buang hasil.
     const settled = await Project.findOneAndUpdate(
       { _id: project._id, status: "revising", version: project.version },
       {
@@ -683,8 +677,6 @@ const runBackgroundRevision = async (project, prompt) => {
           `[AI Revision Error] project ${project._id} already settled, no refund needed`,
         );
     } catch (releaseErr) {
-      // Project tetap "revising": settleIfStale / recoverStaleProjects yang
-      // akan menutup + refund.
       console.error(
         `[AI Revision Error] could not settle project ${project._id}: ${releaseErr.message}`,
       );

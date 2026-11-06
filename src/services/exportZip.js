@@ -1,13 +1,8 @@
 // FILE: src/services/exportZip.js
 //
 // Fase 4: port apa adanya dari client `utils/exportProject.js`.
-// Isi zip (package.json, vite.config.js, index.html, src/index.jsx, src/<file>)
-// dan urutannya sama persis dengan versi client. Yang pindah cuma tempat
-// membangunnya: sekarang di server, hasilnya Buffer.
-//
-// PENTING: `./sandpackDeps.js` HARUS berisi salinan verbatim dari dua export di
-// client `utils/sandpackUtils`: `detectDependencies` dan
-// `PREVIEW_EXTERNAL_RESOURCES`. Jangan diubah supaya hasil zip tetap sama.
+// Fase R6: tambah elemen watermark statis untuk project remake (di luar root
+// React, supaya tetap muncul walau app dihidrasi ulang).
 
 import JSZip from "jszip";
 import {
@@ -15,7 +10,6 @@ import {
   PREVIEW_EXTERNAL_RESOURCES,
 } from "./sandpackDeps.js";
 
-// Project names come from the model: never put them in HTML unescaped
 const escapeHtml = (text) =>
   String(text).replace(
     /[&<>"']/g,
@@ -29,20 +23,38 @@ const escapeHtml = (text) =>
       })[c],
   );
 
-// Nama file zip. Dipakai controller (Content-Disposition); client menghitung
-// dengan rumus yang sama untuk saveAs().
 export const exportFileName = (name) =>
   `${(name || "website").toLowerCase().replace(/[^a-z0-9]+/g, "-")}.zip`;
 
+// Elemen kecil di index.html untuk project remake. Disimpan statis (di luar
+// root React) supaya tetap muncul meski app dihidrasi ulang. Teks badge
+// mengikuti versi EN (ZIP selalu EN, sama seperti title/package).
+function buildRemakeWatermarkHtml(remakeOf, projectId) {
+  if (!Array.isArray(remakeOf) || remakeOf.length === 0) return "";
+  const SITE_URL = process.env.SITE_URL || "https://renscraft.cyou";
+  const reportHref = projectId
+    ? `${SITE_URL}/contact?report=${encodeURIComponent(String(projectId))}`
+    : `${SITE_URL}/contact`;
+  const more = remakeOf.length > 1 ? ` +${remakeOf.length - 1}` : "";
+  const domain = escapeHtml(remakeOf[0]);
+
+  return `  <div id="renscraft-remake-badge" style="position:fixed;bottom:12px;right:12px;z-index:2147483647;display:flex;align-items:center;gap:6px;padding:4px 10px;background:rgba(255,255,255,0.95);border:1px solid #e4e4e7;border-radius:9999px;font:11px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;color:#52525b;box-shadow:0 4px 12px rgba(0,0,0,0.08);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);">
+    <span>Remade from ${domain}${more}</span>
+    <span style="color:#a1a1aa;">&middot;</span>
+    <span>made with Renscraft</span>
+    <span style="color:#a1a1aa;">&middot;</span>
+    <a href="${escapeHtml(reportHref)}" target="_blank" rel="noopener noreferrer" style="color:#dc2626;text-decoration:none;font-weight:600;">Report</a>
+  </div>
+`;
+}
+
 /**
- * @param {{ name?: string, files: Record<string, string> }} project
- *   `files` = { "/App.js": "<kode>" } (hasil filesToObject).
+ * @param {{ name?: string, _id?: any, remakeOf?: string[], files: Record<string, string> }} project
  * @returns {Promise<Buffer>}
  */
 export async function buildExportZip(project) {
   const zip = new JSZip();
 
-  // Normalize files and detect dependencies from import statements
   const fileMap = {};
   for (const [path, content] of Object.entries(project.files || {})) {
     const fileCode =
@@ -51,7 +63,6 @@ export async function buildExportZip(project) {
   }
   const detectedDeps = detectDependencies(fileMap);
 
-  // Add package.json
   zip.file(
     "package.json",
     JSON.stringify(
@@ -85,7 +96,6 @@ export async function buildExportZip(project) {
     ),
   );
 
-  // Add vite.config.js configured for JSX parsing in both .js and .jsx files
   zip.file(
     "vite.config.js",
     `import { defineConfig } from 'vite';
@@ -109,7 +119,8 @@ export default defineConfig({
 `,
   );
 
-  // Add index.html
+  const watermarkHtml = buildRemakeWatermarkHtml(project.remakeOf, project._id);
+
   zip.file(
     "index.html",
     `<!DOCTYPE html>
@@ -124,13 +135,12 @@ ${PREVIEW_EXTERNAL_RESOURCES.map((href) => `  <link rel="stylesheet" href="${hre
 </head>
 <body>
   <div id="root"></div>
-  <script type="module" src="/src/index.jsx"></script>
+${watermarkHtml}  <script type="module" src="/src/index.jsx"></script>
 </body>
 </html>
 `,
   );
 
-  // Add index.jsx entry
   zip.file(
     "src/index.jsx",
     `import React from 'react';
@@ -141,12 +151,10 @@ createRoot(document.getElementById('root')).render(<App />);
 `,
   );
 
-  // Add project files
   for (const [path, content] of Object.entries(fileMap)) {
     const cleanPath = path.startsWith("/") ? path.slice(1) : path;
     zip.file(`src/${cleanPath}`, content);
   }
 
-  // Default JSZip (STORE, tanpa kompresi) sama seperti versi client.
   return zip.generateAsync({ type: "nodebuffer" });
 }

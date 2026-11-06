@@ -241,6 +241,48 @@ export const adminListProjects = asyncHandler(async (req, res) => {
   res.json({ projects, total, page, limit });
 });
 
+// ─── Remakes (takedown per domain) ──────────────────────────────────────────
+//
+// GET /api/admin/remakes?domain=&page=&limit=
+// Domain dinormalisasi (strip protocol/path/www) supaya "https://www.example.com/x"
+// dan "example.com" menghasilkan filter yang sama.
+
+const normalizeRemakeDomain = (raw) => {
+  let d = String(raw || "")
+    .trim()
+    .toLowerCase();
+  if (!d) return "";
+  d = d
+    .replace(/^[a-z]+:\/\//, "")
+    .split("/")[0]
+    .split("?")[0]
+    .split("#")[0];
+  d = d.replace(/^www\./, "");
+  return d;
+};
+
+export const adminListRemakes = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = paginate(req);
+  const domain = normalizeRemakeDomain(req.query.domain);
+
+  const filter = domain
+    ? { remakeOf: domain }
+    : { remakeOf: { $exists: true, $not: { $size: 0 } } };
+
+  const [projects, total] = await Promise.all([
+    Project.find(filter)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .select("name owner published customSubdomain remakeOf createdAt")
+      .populate("owner", "name email")
+      .lean(),
+    Project.countDocuments(filter),
+  ]);
+
+  res.json({ projects, total, page, limit, domain });
+});
+
 // GET /api/admin/orders?page=1&status=pending|paid|...
 export const adminListOrders = asyncHandler(async (req, res) => {
   const { page, limit, skip } = paginate(req);
@@ -540,6 +582,44 @@ export const adminListDynamicApps = asyncHandler(async (req, res) => {
   ]);
 
   res.json({ apps, total, page, limit });
+});
+
+// POST /api/admin/projects/:id/unpublish  { reason? }
+// Idempotent: memanggil pada project yang sudah unpublished tidak error.
+export const adminUnpublishProject = asyncHandler(async (req, res) => {
+  const id = String(req.params.id || "");
+  if (!mongoose.isObjectIdOrHexString(id)) {
+    return fail(res, 404, "PROJECT_NOT_FOUND", {}, "Project not found");
+  }
+
+  const reason = String(req.body?.reason ?? "")
+    .slice(0, 300)
+    .trim();
+
+  const project = await Project.findByIdAndUpdate(
+    id,
+    { $set: { published: false } },
+    {
+      returnDocument: "after",
+      projection: {
+        name: 1,
+        published: 1,
+        remakeOf: 1,
+        customSubdomain: 1,
+        owner: 1,
+      },
+    },
+  ).lean();
+
+  if (!project) {
+    return fail(res, 404, "PROJECT_NOT_FOUND", {}, "Project not found");
+  }
+
+  console.log(
+    `[Admin] Unpublished project ${id} (${project.name})${reason ? `: ${reason}` : ""}`,
+  );
+
+  res.json({ ok: true, project });
 });
 
 // POST /api/admin/dynamic/:id/suspend  { reason? }

@@ -59,6 +59,15 @@ const QualityReportSchema = new Schema(
   { _id: false },
 );
 
+const RemakeConsentSchema = new Schema(
+  {
+    at: { type: Date, required: true },
+    ipHash: { type: String, default: "" },
+    urls: { type: [String], default: [] },
+  },
+  { _id: false },
+);
+
 const ProjectSchema = new Schema(
   {
     name: { type: String, required: true, default: "Untitled Project" },
@@ -81,6 +90,13 @@ const ProjectSchema = new Schema(
       type: Date,
       default: null,
     },
+
+    // ─── FITUR REMAKE DARI URL ───
+    // Array hostname (lowercase tanpa "www") yang di-remake. Unik, maks 5.
+    // Dikosongkan kalau project bukan remake.
+    remakeOf: { type: [String], default: [] },
+    // Bukti consent untuk mode remake. JANGAN pernah dikirim ke publik.
+    remakeConsent: { type: RemakeConsentSchema, default: null },
 
     status: {
       type: String,
@@ -123,6 +139,7 @@ ProjectSchema.index(
     collation: { locale: "en", strength: 2 },
   },
 );
+ProjectSchema.index({ remakeOf: 1 });
 
 ProjectSchema.statics.acquireLock = function (
   id,

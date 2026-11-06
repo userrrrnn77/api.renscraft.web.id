@@ -202,7 +202,7 @@ export async function fetchImage(rawUrl, maxBytes, referer) {
   };
 }
 
-async function fetchText(rawUrl, opts) {
+export async function fetchText(rawUrl, opts) {
   const r = await fetchLimited(rawUrl, opts);
   return {
     url: r.url,
@@ -460,6 +460,286 @@ export function extractDesignTokens(css) {
   };
 }
 
+export function extractSections(html, baseUrl) {
+  const $ = cheerio.load(html);
+
+  const title = $("title").first().text().trim();
+  const description = (
+    $('meta[name="description"]').attr("content") ||
+    $('meta[property="og:description"]').attr("content") ||
+    ""
+  ).trim();
+
+  // ── Contact extraction (sebelum tags dibuang) ─────────────────────────
+  const phones = [];
+  const emails = [];
+  const addresses = [];
+  const socials = [];
+  const mapEmbeds = [];
+
+  const addUnique = (arr, v, cap = 8) => {
+    const s = String(v ?? "").trim();
+    if (!s || s.length > 300) return;
+    if (arr.length >= cap) return;
+    if (arr.includes(s)) return;
+    arr.push(s);
+  };
+
+  $('a[href^="tel:"], a[href^="TEL:"]').each((_, el) => {
+    const v = ($(el).attr("href") || "").replace(/^tel:/i, "").trim();
+    if (v) addUnique(phones, v);
+  });
+
+  $('a[href^="mailto:"], a[href^="MAILTO:"]').each((_, el) => {
+    const v = ($(el).attr("href") || "")
+      .replace(/^mailto:/i, "")
+      .split("?")[0]
+      .trim();
+    if (v) addUnique(emails, v);
+  });
+
+  const SOCIAL_PATTERNS = [
+    [/instagram\.com/i, "Instagram"],
+    [/(?:facebook\.com|fb\.com)/i, "Facebook"],
+    [/tiktok\.com/i, "TikTok"],
+    [/(?:youtube\.com|youtu\.be)/i, "YouTube"],
+    [/(?:twitter\.com|x\.com)/i, "X/Twitter"],
+    [/(?:wa\.me|whatsapp\.com)/i, "WhatsApp"],
+  ];
+
+  $("a[href]").each((_, el) => {
+    const raw = $(el).attr("href");
+    if (!raw) return;
+    if (/^(mailto:|tel:|javascript:|#)/i.test(raw)) return;
+    let abs;
+    try {
+      abs = new URL(raw, baseUrl).href;
+    } catch {
+      return;
+    }
+    let label = null;
+    for (const [re, name] of SOCIAL_PATTERNS) {
+      if (re.test(abs)) {
+        label = name;
+        break;
+      }
+    }
+    if (!label) return;
+    addUnique(socials, `${label}: ${abs}`, 10);
+  });
+
+  $("address").each((_, el) => {
+    const t = $(el).text().replace(/\s+/g, " ").trim();
+    if (t) addUnique(addresses, t, 5);
+  });
+
+  $("iframe[src]").each((_, el) => {
+    const src = $(el).attr("src");
+    if (!src) return;
+    if (
+      !/(google\.com\/maps|maps\.google|openstreetmap|bing\.com\/maps|waze\.com)/i.test(
+        src,
+      )
+    )
+      return;
+    let abs;
+    try {
+      abs = new URL(src, baseUrl).href;
+    } catch {
+      return;
+    }
+    addUnique(mapEmbeds, abs, 5);
+  });
+
+  // ── Buang tag yang tidak relevan sebelum traversal ────────────────────
+  $("script, style, noscript, svg, template").remove();
+
+  const sections = [];
+  let totalChars = 0;
+
+  const currentSection = () => sections[sections.length - 1] || null;
+
+  const pushSection = (heading, level) => {
+    sections.push({
+      heading: String(heading || "")
+        .replace(/\s+/g, " ")
+        .trim(),
+      level: Number.isFinite(level) ? level : 2,
+      paragraphs: [],
+      items: [],
+      ctas: [],
+      images: [],
+    });
+  };
+
+  const addText = (field, raw) => {
+    const v = String(raw ?? "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!v || v.length < 2 || v.length > MAX_BLOCK_CHARS) return false;
+    if (totalChars + v.length > MAX_TEXT_CHARS) return false;
+    const s = currentSection();
+    if (!s) return false;
+    const cap = field === "paragraphs" ? 20 : field === "items" ? 30 : 6;
+    if (s[field].length >= cap) return false;
+    s[field].push(v);
+    totalChars += v.length + 1;
+    return true;
+  };
+
+  const addImage = (url, alt) => {
+    if (!url) return;
+    const s = currentSection();
+    if (!s || s.images.length >= 6) return;
+    s.images.push({
+      url,
+      alt: String(alt || "")
+        .trim()
+        .slice(0, 200),
+    });
+  };
+
+  const hasH1H2 = $("h1, h2").length > 0;
+
+  if (hasH1H2) {
+    const root = $("main").length ? $("main") : $("body");
+    let opened = false;
+
+    root
+      .find("h1, h2, h3, p, li, button, a[role='button'], blockquote, img")
+      .each((_, el) => {
+        const $el = $(el);
+        const tag = (el.tagName || "").toLowerCase();
+
+        if (tag === "h1" || tag === "h2") {
+          pushSection($el.text(), Number(tag[1]));
+          opened = true;
+          return;
+        }
+
+        if (tag === "h3") {
+          if (!opened) return;
+          const t = $el.text().replace(/\s+/g, " ").trim();
+          if (!t || t.length > MAX_BLOCK_CHARS - 5) return;
+          addText("paragraphs", `### ${t}`);
+          return;
+        }
+
+        if (tag === "img") {
+          if (!opened) return;
+          const raw =
+            bestFromSrcset($el.attr("srcset")) ||
+            $el.attr("data-src") ||
+            $el.attr("src");
+          addImage(normalizeImageUrl(raw, baseUrl), $el.attr("alt"));
+          return;
+        }
+
+        if (!opened) {
+          const text = $el.text().replace(/\s+/g, " ").trim();
+          if (!text) return;
+          pushSection("", 2);
+          opened = true;
+        }
+
+        if (tag === "li") {
+          addText("items", $el.text());
+          return;
+        }
+        if (
+          tag === "button" ||
+          (tag === "a" && $el.attr("role") === "button")
+        ) {
+          addText("ctas", $el.text());
+          return;
+        }
+        if (tag === "blockquote" || tag === "p") {
+          addText("paragraphs", $el.text());
+        }
+      });
+
+    if (sections.length > 0 && !sections[0].heading) {
+      const s = sections[0];
+      if (
+        s.paragraphs.length === 0 &&
+        s.items.length === 0 &&
+        s.ctas.length === 0 &&
+        s.images.length === 0
+      ) {
+        sections.shift();
+      }
+    }
+  } else {
+    const containers = $(
+      "main > section, main > div, section, header > div, article",
+    ).toArray();
+
+    if (containers.length > 0) {
+      for (const el of containers) {
+        const $el = $(el);
+        const h = $el
+          .find("h1, h2, h3")
+          .first()
+          .text()
+          .replace(/\s+/g, " ")
+          .trim();
+        pushSection(h, 2);
+
+        $el.find("p, li, button, blockquote").each((__, child) => {
+          const $c = $(child);
+          const ctag = (child.tagName || "").toLowerCase();
+          if (ctag === "li") addText("items", $c.text());
+          else if (ctag === "button") addText("ctas", $c.text());
+          else addText("paragraphs", $c.text());
+        });
+
+        $el.find("img").each((__, child) => {
+          const $c = $(child);
+          const raw =
+            bestFromSrcset($c.attr("srcset")) ||
+            $c.attr("data-src") ||
+            $c.attr("src");
+          addImage(normalizeImageUrl(raw, baseUrl), $c.attr("alt"));
+        });
+      }
+    } else {
+      pushSection(title || "", 1);
+      $("p, li, button, blockquote").each((_, el) => {
+        const $el = $(el);
+        const tag = (el.tagName || "").toLowerCase();
+        if (tag === "li") addText("items", $el.text());
+        else if (tag === "button") addText("ctas", $el.text());
+        else addText("paragraphs", $el.text());
+      });
+      $("img").each((_, el) => {
+        const $el = $(el);
+        const raw =
+          bestFromSrcset($el.attr("srcset")) ||
+          $el.attr("data-src") ||
+          $el.attr("src");
+        addImage(normalizeImageUrl(raw, baseUrl), $el.attr("alt"));
+      });
+    }
+  }
+
+  const hasContact = Boolean(
+    phones.length ||
+    emails.length ||
+    addresses.length ||
+    socials.length ||
+    mapEmbeds.length,
+  );
+
+  return {
+    url: baseUrl,
+    title,
+    description,
+    sections,
+    contact: { phones, emails, addresses, socials, mapEmbeds },
+    hasContact,
+  };
+}
+
 // ─── Satu URL -> satu referensi ──────────────────────────────────────────────
 
 // Rangka "referensi" untuk URL yang ternyata gambar langsung (tanpa teks/CSS).
@@ -503,8 +783,7 @@ export function mergeRendered(info, renderedHtml, baseUrl) {
 }
 
 // `render(url) -> { html, url } | null` (opsional, lihat pageRenderer.js).
-async function readReference(rawUrl, render) {
-  // Ekstensi gambar jelas: tidak perlu fetch halaman. assetMirror yang mengunduh.
+async function readReference(rawUrl, render, { mode = "inspiration" } = {}) {
   const early = assertPublicUrl(rawUrl);
   if (IMAGE_EXT_RE.test(early.pathname)) {
     return directImageReference(early.href);
@@ -516,12 +795,11 @@ async function readReference(rawUrl, render) {
     accept: "text/html,application/xhtml+xml,image/*;q=0.8,*/*;q=0.5",
     skipBodyFor: /^image\//i,
   });
-  // Tidak ada ekstensi tapi content-type-nya image/* (mis. /avatar?id=3)
   if (/^image\//i.test(page.type)) return directImageReference(page.url);
 
-  const html = page.buffer.toString("utf8").slice(0, MAX_HTML_BYTES);
+  let finalHtml = page.buffer.toString("utf8").slice(0, MAX_HTML_BYTES);
   let finalUrl = page.url;
-  let info = extractPage(html, finalUrl);
+  let info = extractPage(finalHtml, finalUrl);
 
   if (info.text.length < MIN_TEXT_CHARS && render) {
     try {
@@ -534,6 +812,7 @@ async function readReference(rawUrl, render) {
           );
           info = merged;
           finalUrl = r.url || finalUrl;
+          finalHtml = r.html;
         }
       }
     } catch (err) {
@@ -553,7 +832,29 @@ async function readReference(rawUrl, render) {
     if (s.status === "fulfilled") css += `\n${s.value.text}`;
   }
 
-  return { url: finalUrl, ...info, design: extractDesignTokens(css) };
+  const out = { url: finalUrl, ...info, design: extractDesignTokens(css) };
+
+  if (mode === "remake") {
+    try {
+      const s = extractSections(finalHtml, finalUrl);
+      out.sections = s.sections;
+      out.contact = s.contact;
+      out.hasContact = s.hasContact;
+    } catch (err) {
+      console.warn(`[Sections] failed: ${err.message}`);
+      out.sections = [];
+      out.contact = {
+        phones: [],
+        emails: [],
+        addresses: [],
+        socials: [],
+        mapEmbeds: [],
+      };
+      out.hasContact = false;
+    }
+  }
+
+  return out;
 }
 
 // ─── Token gambar ────────────────────────────────────────────────────────────
@@ -647,9 +948,85 @@ const trimTo = (s, n) => {
   return nl > n * 0.6 ? cut.slice(0, nl) : cut; // potong di akhir baris
 };
 
-const formatReference = (r, i, { textBudget, includeDesign }) => {
+const formatSectionsOutline = (sections, budget, contact, hasContact) => {
+  const lines = [];
+  let used = 0;
+
+  const push = (line) => {
+    if (!line) return false;
+    const sep = lines.length > 0 ? 1 : 0;
+    if (used + sep + line.length > budget) return false;
+    lines.push(line);
+    used += sep + line.length;
+    return true;
+  };
+
+  for (const s of sections || []) {
+    if (!s) continue;
+    const level = Math.max(1, Math.min(3, s.level || 2));
+    const headingLine = s.heading
+      ? `${"#".repeat(level)} ${s.heading}`
+      : "# (section)";
+    if (!push(headingLine)) return lines.join("\n");
+
+    for (const p of s.paragraphs || []) {
+      if (!push(p)) return lines.join("\n");
+    }
+    for (const it of s.items || []) {
+      if (!push(`- ${it}`)) return lines.join("\n");
+    }
+    for (const ct of s.ctas || []) {
+      if (!push(`CTA: ${ct}`)) return lines.join("\n");
+    }
+  }
+
+  if (hasContact && contact) {
+    const contactLines = [];
+    for (const p of contact.phones || []) contactLines.push(`- phone: ${p}`);
+    for (const e of contact.emails || []) contactLines.push(`- email: ${e}`);
+    for (const a of contact.addresses || [])
+      contactLines.push(`- address: ${a}`);
+    for (const sc of contact.socials || [])
+      contactLines.push(`- social: ${sc}`);
+    for (const m of contact.mapEmbeds || []) contactLines.push(`- map: ${m}`);
+
+    if (contactLines.length > 0) {
+      push("");
+      if (push("Contact found:")) {
+        for (const line of contactLines) {
+          if (!push(line)) break;
+        }
+      }
+    }
+  }
+
+  return lines.join("\n");
+};
+
+const formatReference = (r, i, { textBudget, includeDesign, mode }) => {
   const d = r.design;
   const parts = [`<reference index="${i + 1}" url="${clean(r.url)}">`];
+
+  // Inspiration mode: halaman HTML hanya menyumbang design tokens + theme
+  // color. Tidak ada title/description/teks/gambar yang ikut.
+  if (mode === "inspiration" && !r.directImage) {
+    parts.push(
+      "(Design inspiration only. Do not copy text or images from this site.)",
+    );
+    const fonts = [...new Set([...r.fonts, ...d.fonts])].slice(0, 6);
+    const design = [
+      r.themeColor && `Theme color: ${r.themeColor}`,
+      d.colors.length && `Colors (most used first): ${d.colors.join(", ")}`,
+      fonts.length && `Fonts: ${fonts.join(" | ")}`,
+      d.radii.length && `Border radius: ${d.radii.join(" | ")}`,
+      d.shadows.length && `Shadows: ${d.shadows.join(" | ")}`,
+      d.vars.length && `CSS variables: ${d.vars.join("; ")}`,
+    ].filter(Boolean);
+    if (design.length)
+      parts.push(`Design tokens:\n${clean(design.join("\n"))}`);
+    parts.push("</reference>");
+    return parts.join("\n");
+  }
 
   if (r.title) parts.push(`Title: ${clean(r.title)}`);
   if (r.description) parts.push(`Description: ${clean(r.description)}`);
@@ -658,6 +1035,27 @@ const formatReference = (r, i, { textBudget, includeDesign }) => {
     parts.push(
       "(Direct image link from the user. It has no page text; the image is listed under Available images below.)",
     );
+  } else if (
+    mode === "remake" &&
+    ((Array.isArray(r.sections) && r.sections.length > 0) || r.hasContact)
+  ) {
+    const outline = formatSectionsOutline(
+      r.sections || [],
+      textBudget,
+      r.contact,
+      r.hasContact,
+    );
+    if (outline.length > 0) {
+      parts.push(`Page content (outline):\n${clean(outline)}`);
+    } else if (r.text.length < MIN_TEXT_CHARS) {
+      parts.push(
+        "(Little text found: this page is probably rendered with JavaScript, so its content could not be read.)",
+      );
+    } else {
+      parts.push(
+        `Page content (outline):\n${clean(trimTo(r.text, textBudget))}`,
+      );
+    }
   } else if (r.text.length < MIN_TEXT_CHARS) {
     parts.push(
       "(Little text found: this page is probably rendered with JavaScript, so its content could not be read.)",
@@ -706,32 +1104,162 @@ const renderWithBrowser = async (url) => {
 // gambar sumber dengan URL permanen di storage kita. Disuntik dari luar, bukan
 // di-import di sini, supaya tidak ada circular import (assetMirror memakai
 // fetchImage dari file ini).
+async function expandUrlsForCrawl(rawUrls, render, deadline) {
+  const { discoverPages } = await import("./siteCrawler.js");
+
+  const out = [];
+  const seen = new Set();
+
+  for (const u of rawUrls) {
+    if (out.length >= MAX_URLS) break;
+    if (Date.now() >= deadline) break;
+
+    let isRoot = false;
+    try {
+      const parsed = assertPublicUrl(u);
+      isRoot = parsed.pathname === "" || parsed.pathname === "/";
+    } catch {
+      isRoot = false;
+    }
+
+    if (!isRoot) {
+      if (!seen.has(u)) {
+        seen.add(u);
+        out.push({ url: u, isPrimary: true });
+      }
+      continue;
+    }
+
+    const remaining = Math.max(1000, deadline - Date.now());
+    let discovered = [];
+    try {
+      discovered = await discoverPages(u, { timeoutMs: remaining, render });
+    } catch {
+      discovered = [];
+    }
+
+    if (!discovered.length) {
+      if (!seen.has(u)) {
+        seen.add(u);
+        out.push({ url: u, isPrimary: true });
+      }
+      continue;
+    }
+
+    for (const page of discovered) {
+      if (out.length >= MAX_URLS) break;
+      if (seen.has(page.url)) continue;
+      seen.add(page.url);
+      out.push({ url: page.url, isPrimary: page.source === "root" });
+    }
+    seen.add(u);
+  }
+
+  return out;
+}
+
+async function readAllLimited(
+  urls,
+  render,
+  concurrency,
+  deadline,
+  mode = "inspiration",
+) {
+  const results = new Array(urls.length);
+  let next = 0;
+
+  const worker = async () => {
+    while (true) {
+      if (deadline && Date.now() >= deadline) return;
+      const i = next++;
+      if (i >= urls.length) return;
+      try {
+        results[i] = {
+          status: "fulfilled",
+          value: await readReference(urls[i], render, { mode }),
+        };
+      } catch (reason) {
+        results[i] = { status: "rejected", reason };
+      }
+    }
+  };
+
+  const n = Math.min(concurrency, urls.length);
+  await Promise.all(Array.from({ length: n }, () => worker()));
+
+  for (let i = 0; i < urls.length; i++) {
+    if (!results[i]) {
+      results[i] = {
+        status: "rejected",
+        reason: new Error("crawl budget exceeded"),
+        budgetExceeded: true,
+      };
+    }
+  }
+
+  return results;
+}
 export async function buildReferenceContext(
   prompt,
   extraUrls = [],
-  { mirror, render = renderWithBrowser, extraAssets = [] } = {},
+  {
+    mirror,
+    render = renderWithBrowser,
+    extraAssets = [],
+    mode = "inspiration",
+  } = {},
 ) {
-  const urls = [...new Set([...extractUrls(prompt), ...extraUrls])].slice(
-    0,
-    MAX_URLS,
-  );
+  const refMode = mode === "remake" ? "remake" : "inspiration";
 
-  // Kalau nggak ada URL dan nggak ada upload, nganggur.
+  const rawUrls = [...new Set([...extractUrls(prompt), ...extraUrls])];
+
+  if (rawUrls.length === 0 && extraAssets.length === 0) {
+    return { context: "", failed: [], assets: [] };
+  }
+
+  // Remake + root URL → crawl untuk kumpulkan halaman. Inspiration atau URL
+  // dengan path spesifik → pakai URL apa adanya.
+  let expanded;
+  let crawlDeadline = null;
+  if (refMode === "remake") {
+    const crawlTimeoutMs =
+      Number(process.env.REFERENCE_CRAWL_TIMEOUT_MS) || 60000;
+    crawlDeadline = Date.now() + crawlTimeoutMs;
+    expanded = await expandUrlsForCrawl(rawUrls, render, crawlDeadline);
+  } else {
+    expanded = rawUrls
+      .slice(0, MAX_URLS)
+      .map((u) => ({ url: u, isPrimary: true }));
+  }
+
+  const urls = expanded.map((e) => e.url);
+
   if (urls.length === 0 && extraAssets.length === 0) {
     return { context: "", failed: [], assets: [] };
   }
 
-  const settled =
-    urls.length > 0
-      ? await Promise.allSettled(urls.map((u) => readReference(u, render)))
-      : [];
+  // Remake: reads dibatasi concurrency 2 dan berbagi deadline dengan crawl.
+  // Inspiration: baca semua paralel seperti sebelumnya.
+  let settled;
+  if (refMode === "remake") {
+    settled = await readAllLimited(urls, render, 2, crawlDeadline, "remake");
+  } else {
+    settled =
+      urls.length > 0
+        ? await Promise.allSettled(urls.map((u) => readReference(u, render)))
+        : [];
+  }
 
   const refs = [];
   const failed = [];
 
   settled.forEach((s, i) => {
-    if (s.status === "fulfilled") refs.push({ ...s.value, primary: true });
-    else {
+    if (s.status === "fulfilled") {
+      refs.push({
+        ...s.value,
+        primary: expanded[i]?.isPrimary !== false,
+      });
+    } else {
       failed.push({
         url: urls[i],
         reason:
@@ -762,7 +1290,11 @@ export async function buildReferenceContext(
       const origin = new URL(r.url).origin;
       const includeDesign = !seenOrigins.has(origin);
       seenOrigins.add(origin);
-      return formatReference(r, i, { textBudget: budgetFor(r), includeDesign });
+      return formatReference(r, i, {
+        textBudget: budgetFor(r),
+        includeDesign,
+        mode: refMode,
+      });
     })
     .join("\n\n");
 
@@ -774,14 +1306,11 @@ export async function buildReferenceContext(
       .slice(0, n);
 
   let assets = [];
-  const assetReferers = []; // halaman tempat tiap gambar ditemukan (untuk Referer)
+  const assetReferers = [];
   const assetLines = [];
   const seenImages = new Set();
   let hasLabeledImages = false;
 
-  // 1) User uploads — selalu duluan, prioritas tertinggi.
-  //    Mereka udah di R2 (bukan hotlink), jadi nggak perlu di-mirror.
-  //    `label` = nama file tanpa ekstensi (kalau ada & berguna).
   for (const item of extraAssets) {
     const asset = typeof item === "string" ? { url: item } : item;
     const { url, label, source, photographer } = asset || {};
@@ -816,8 +1345,9 @@ export async function buildReferenceContext(
     }
   }
 
-  // 2) Hasil scrape dari halaman referensi.
+  // Inspiration mode: halaman HTML tidak menyumbang gambar.
   for (const r of refs) {
+    if (refMode === "inspiration" && !r.directImage) continue;
     let from = "/";
     try {
       from = new URL(r.url).pathname || "/";
@@ -849,7 +1379,6 @@ export async function buildReferenceContext(
   );
   const hasUploads = extraAssets.length > 0;
 
-  // ── Image section ──────────────────────────────────────────────────────
   const imageSection = assets.length
     ? "\n\n## Available images\n" +
       (hasUploads
@@ -894,8 +1423,6 @@ export async function buildReferenceContext(
         body
       : "") + imageSection;
 
-  // Salin gambar dari scrape ke R2 (upload user udah di R2, akan di-skip
-  // otomatis lewat isOwnUrl()). Tanpa `mirror`, URL tetap URL asli.
   if (mirror && assets.length > 0) {
     try {
       assets = await mirror(assets, assetReferers);

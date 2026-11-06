@@ -19,31 +19,45 @@ import {
 } from "../services/brief/briefFlow.js";
 import { fail } from "../utils/apiError.js";
 import { guessCategory } from "../services/brief/categoryGuess.js";
+import { pageUrlsOf } from "../utils/referenceUrls.js";
+import { getClientIp, hashIp } from "../services/abuseGuard.js";
 
 // ── R3: Safety net coverage check ──────────────────────────────────────────
-// Composer LLM bisa bandel nambah x_* (nice-to-have) yang gak kejawab,
-// padahal must-have udah ke-extract dari prompt. Coverage check memastikan
-// prompt lengkap tetap auto-start walaupun composer kurang patuh.
 function shouldSkipWizard(slots = [], answers = {}) {
   const facts = (slots ?? []).filter((s) => s.group === "fact");
   if (facts.length === 0) return true;
 
   const answered = facts.filter((s) => answers[s.key]?.value);
-  // ≥ 60% fakta kejawab dari prompt → cukup, langsung generate
   if (answered.length / facts.length >= 0.6) return true;
 
-  // Sisa pertanyaan SEMUA nice-to-have (x_* tanpa mapsTo) → skip juga
   const open = facts.filter((s) => !answers[s.key]?.value);
   return open.every((s) => s.key.startsWith("x_") && !s.mapsTo);
 }
 
-// Wrapper: coverage check dulu, baru pickQuestions kalau memang perlu wizard.
-// Dipakai di semua call site (create awal, background success, background
-// fallback, category change) supaya perilakunya konsisten.
-function pickQuestionsSafe({ category, answers, slots }) {
+// Wrapper: kalau prompt punya URL halaman (needsReference), JANGAN auto-skip
+// wizard — user harus lewat langkah Referensi dulu (pilih mode / consent).
+function pickQuestionsSafe({
+  category,
+  answers,
+  slots,
+  needsReference = false,
+}) {
+  if (needsReference) return pickQuestions({ category, answers, slots });
   if (shouldSkipWizard(slots, answers)) return [];
   return pickQuestions({ category, answers, slots });
 }
+
+// Helper: bungkus buildState() + needsReference.
+const stateWithReference = (briefLike) => {
+  const obj =
+    typeof briefLike?.toObject === "function"
+      ? briefLike.toObject()
+      : (briefLike ?? {});
+  return {
+    ...buildState(obj),
+    needsReference: pageUrlsOf(obj?.prompt ?? "").length > 0,
+  };
+};
 
 const MAX_PROMPT_LENGTH = 4000;
 const MAX_ANSWER_KEYS = 12;
@@ -53,16 +67,11 @@ const EXTRA_LABEL_MIN = 2;
 const EXTRA_LABEL_MAX = 60;
 const NOT_FOUND = "Brief tidak ditemukan atau sudah kedaluwarsa";
 
-// Retry loop classifier: 3 attempt total, delay 2s lalu 4s antar attempt.
-// Kalau semua gagal, brief di-set "failed" dan client diminta retry.
 const CLASSIFY_MAX_ATTEMPTS = 3;
 const CLASSIFY_RETRY_DELAYS_MS = [2000, 4000];
 
 const isValidId = (id) => mongoose.isObjectIdOrHexString(id);
 
-// READ: pakai di GET /api/briefs/:id. "failed" ikut dibaca supaya client
-// bisa lihat status dan kasih toast. WRITE (PATCH) sengaja tidak boleh
-// menyentuh "failed" — brief yang gagal di klasifikasi gak bisa di-edit.
 async function findReadableBrief(req) {
   const { id } = req.params;
   if (!isValidId(id)) return null;
@@ -73,7 +82,6 @@ async function findReadableBrief(req) {
   });
 }
 
-// WRITE: pakai di PATCH /api/briefs/:id. Brief "failed" tidak bisa diubah.
 async function findOpenBrief(req) {
   const { id } = req.params;
   if (!isValidId(id)) return null;
@@ -84,7 +92,6 @@ async function findOpenBrief(req) {
   });
 }
 
-// Slug key untuk slot custom (x_<label>). Unik dijamin pemanggil via usedKeys.
 const slugKey = (label) => {
   const base = String(label)
     .toLowerCase()
@@ -96,8 +103,6 @@ const slugKey = (label) => {
   return base ? `x_${base}` : "x_field";
 };
 
-// SlotDef bentuk lengkap dari catalog category. Dipakai saat fallback classifier
-// dan saat category berubah — supaya origin & mapsTo konsisten di dua tempat.
 const buildCatalogSlotDef = (s) => ({
   key: s.key,
   label: s.label,
@@ -121,12 +126,8 @@ const buildCatalogSlotDef = (s) => ({
               : null,
 });
 
-// Bentuk awal sebelum classifier jalan. Slots ini cuma placeholder sementara —
-// akan diganti oleh hasil classifier kalau sukses. Kalau classifier gagal
-// total, brief ditandai "failed" dan client gak akan lihat slots ini.
 const fallbackResult = (prompt = "") => {
   const guess = guessCategory(prompt);
-  // app_tool/dashboard tidak punya slot -> biar classifier yang memutuskan
   const category = guess && categorySlots(guess).length > 0 ? guess : "lainnya";
   return {
     category,
@@ -136,10 +137,6 @@ const fallbackResult = (prompt = "") => {
   };
 };
 
-// Jalan di background: client sudah dibalas "classifying" dan polling.
-// Retry up to CLASSIFY_MAX_ATTEMPTS kali sebelum menyerah. Kalau semua gagal,
-// brief di-set "failed" (bukan "open" dengan fallback) supaya client tahu
-// harus retry, dan user tidak jatuh ke wizard generic yang mungkin gak cocok.
 async function classifyInBackground(briefId, prompt) {
   let result = null;
   let lastError = null;
@@ -175,8 +172,6 @@ async function classifyInBackground(briefId, prompt) {
       `[Brief] classify failed for ${briefId} after ${CLASSIFY_MAX_ATTEMPTS} attempts: ${err?.message ?? err}`,
     );
     try {
-      // Atomic: cuma set failed kalau brief masih "classifying". Kalau sudah
-      // diubah oleh proses lain (mis. edge case PATCH), jangan timpa.
       const updated = await Brief.findOneAndUpdate(
         { _id: briefId, status: "classifying" },
         { $set: { status: "failed" } },
@@ -190,7 +185,6 @@ async function classifyInBackground(briefId, prompt) {
         );
       }
     } catch (updateErr) {
-      // Kalau TTL keburu hapus, update gagal. Itu OK — brief hilang sendirinya.
       console.error(
         `[Brief] failed to mark failed for ${briefId}: ${updateErr?.message ?? updateErr}`,
       );
@@ -198,19 +192,20 @@ async function classifyInBackground(briefId, prompt) {
     return;
   }
 
-  // Success: simpan state open
   try {
     await Brief.findByIdAndUpdate(briefId, {
       category: result.category,
       confidence: result.confidence,
       answers: result.answers,
       slots: result.slots,
-      questionKeys: pickQuestionsSafe(result),
+      questionKeys: pickQuestionsSafe({
+        ...result,
+        needsReference: pageUrlsOf(prompt).length > 0,
+      }),
       status: "open",
     });
     console.log(`[Brief] saved ${briefId}`);
   } catch (err) {
-    // Tetap "classifying": TTL index yang bersihin.
     console.error(
       `[Brief] update failed for ${briefId}: ${err?.message ?? err}`,
     );
@@ -252,8 +247,8 @@ export const createBrief = asyncHandler(async (req, res) => {
     );
   }
 
-  // Brief awal (tanpa AI), status "classifying"
   const fallback = fallbackResult();
+  const needsReference = pageUrlsOf(prompt).length > 0;
   const brief = await Brief.create({
     owner,
     prompt,
@@ -261,15 +256,14 @@ export const createBrief = asyncHandler(async (req, res) => {
     confidence: fallback.confidence,
     answers: fallback.answers,
     slots: fallback.slots,
-    questionKeys: pickQuestionsSafe(fallback),
+    questionKeys: pickQuestionsSafe({ ...fallback, needsReference }),
     status: "classifying",
   });
 
-  // Classifier jalan di background (dengan retry). Tidak di-await.
   void classifyInBackground(brief._id, prompt);
 
   return res.json({
-    ...buildState(brief.toObject()),
+    ...stateWithReference(brief),
     briefId: brief._id,
     status: "classifying",
   });
@@ -281,7 +275,7 @@ export const getBrief = asyncHandler(async (req, res) => {
   if (!brief) {
     return fail(res, 404, "BRIEF_NOT_FOUND", {}, NOT_FOUND);
   }
-  return res.json(buildState(brief.toObject()));
+  return res.json(stateWithReference(brief));
 });
 
 // PATCH /api/briefs/:id
@@ -292,6 +286,57 @@ export const patchBrief = asyncHandler(async (req, res) => {
   }
 
   const body = req.body ?? {};
+
+  // ─── refMode + refConsent ─────────────────────────────────────────────
+  if (body.refMode !== undefined) {
+    if (body.refMode === null) {
+      brief.refMode = null;
+    } else if (body.refMode === "inspiration" || body.refMode === "remake") {
+      brief.refMode = body.refMode;
+    } else {
+      return fail(
+        res,
+        400,
+        "BRIEF_REF_MODE_INVALID",
+        {},
+        "refMode tidak valid",
+      );
+    }
+  }
+
+  if (body.refConsent !== undefined) {
+    if (body.refConsent === true) {
+      if (!brief.refConsent?.accepted) {
+        const ip = getClientIp(req);
+        brief.refConsent = {
+          accepted: true,
+          at: new Date(),
+          ipHash: ip ? hashIp(ip) : "",
+        };
+      }
+    } else if (body.refConsent === false || body.refConsent === null) {
+      brief.refConsent = null;
+    } else {
+      return fail(
+        res,
+        400,
+        "BRIEF_REF_CONSENT_INVALID",
+        {},
+        "refConsent harus true",
+      );
+    }
+  }
+
+  if (brief.refMode === "remake" && !brief.refConsent?.accepted) {
+    return fail(
+      res,
+      400,
+      "BRIEF_REF_CONSENT_REQUIRED",
+      {},
+      "Consent wajib untuk mode remake",
+    );
+  }
+
   const incoming = body.answers;
 
   if (incoming !== undefined) {
@@ -316,11 +361,6 @@ export const patchBrief = asyncHandler(async (req, res) => {
   }
 
   // ─── 1. Category change ────────────────────────────────────────────────
-  //
-  // Rebuild composer slots untuk kategori baru, PERTAHANKAN user slots.
-  // Composer slots lama (origin "catalog" / "ai") di kategori lama sudah nggak
-  // relevan, jadi dibuang. User slots menang kalau key-nya bentrok dengan
-  // catalog baru (biar user bisa override label).
   if (body.category !== undefined) {
     if (typeof body.category !== "string" || !CATEGORY_IDS.has(body.category)) {
       return fail(
@@ -350,17 +390,16 @@ export const patchBrief = asyncHandler(async (req, res) => {
       brief.answers = kept;
       brief.markModified("answers");
       brief.markModified("slots");
-      brief.questionKeys = pickQuestionsSafe(brief.toObject());
+      brief.questionKeys = pickQuestionsSafe({
+        ...brief.toObject(),
+        needsReference: pageUrlsOf(brief.prompt).length > 0,
+      });
     }
   }
 
   const errors = {};
 
   // ─── 2. Tambah slot custom (extraSlots) ────────────────────────────────
-  //
-  // Prinsip: KALAU ADA SATU SAJA item yang invalid, tidak ada yang di-assign
-  // ke `brief`. Semua build di local variable dulu (`newDefs`, `nextAnswers`),
-  // assign setelah semua valid.
   const extra = body.extraSlots;
   if (extra !== undefined) {
     if (!Array.isArray(extra) || extra.length === 0) {
@@ -458,7 +497,6 @@ export const patchBrief = asyncHandler(async (req, res) => {
       nextAnswers[key] = { value: norm.value, source: "user" };
     }
 
-    // Assign sekali, setelah semua valid. Insert sebelum vibe kalau ada.
     const baseSlots = brief.slots ?? [];
     const vibeIdx = baseSlots.findIndex(
       (s) => s.key === "vibe" || s.group === "style",
@@ -517,5 +555,8 @@ export const patchBrief = asyncHandler(async (req, res) => {
   }
 
   await brief.save();
-  return res.json({ ...buildState(brief.toObject()), errors });
+  return res.json({
+    ...stateWithReference(brief),
+    errors,
+  });
 });

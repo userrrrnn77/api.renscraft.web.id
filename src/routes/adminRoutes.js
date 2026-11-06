@@ -19,6 +19,8 @@ import {
   adminListDynamicApps,
   adminSuspendDynamicApp,
   adminRestoreDynamicApp,
+  adminListRemakes,
+  adminUnpublishProject,
 } from "../controllers/adminController.js";
 import { adminMiddleware } from "../middleware/adminMiddleware.js";
 
@@ -50,5 +52,9 @@ adminRouter.delete("/redeem/:id", adminDeleteRedeemCode);
 adminRouter.get("/dynamic", adminListDynamicApps);
 adminRouter.post("/dynamic/:id/suspend", adminSuspendDynamicApp);
 adminRouter.post("/dynamic/:id/restore", adminRestoreDynamicApp);
+
+// Remakes (takedown)
+adminRouter.get("/remakes", adminListRemakes);
+adminRouter.post("/projects/:id/unpublish", adminUnpublishProject);
 
 export default adminRouter;

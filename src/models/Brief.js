@@ -4,9 +4,6 @@ import mongoose, { Schema } from "mongoose";
 import { CATEGORY_IDS } from "../services/brief/slotCatalog.js";
 import { briefConfig } from "../services/brief/briefConfig.js";
 
-// Slot yang di-generate AI composer untuk brief ini. Bentuknya sama dengan
-// slot catalog static (SLOTS), jadi semua modul hilir (validasi, rendering,
-// placeholder) bisa memperlakukan keduanya dengan cara yang sama.
 const SlotDefSchema = new Schema(
   {
     key: { type: String, required: true },
@@ -29,12 +26,17 @@ const SlotDefSchema = new Schema(
     group: { type: String, enum: ["fact", "style"], default: "fact" },
     placeholder: { type: String, default: "" },
     options: { type: [String], default: [] },
-    // "catalog" = pakai key standar dari SLOTS (placeholder & validasi katalog
-    // berlaku). "ai" = key x_* yang dibuat composer.
     origin: { type: String, enum: ["catalog", "ai", "user"], default: "ai" },
-    // Optional: memetakan ke Project.contract.facts key, mis. "openingHours".
-    // Dipakai mergeBriefFacts supaya facts tetap terisi walau key custom.
     mapsTo: { type: String, default: null },
+  },
+  { _id: false },
+);
+
+const RefConsentSchema = new Schema(
+  {
+    accepted: { type: Boolean, required: true },
+    at: { type: Date, required: true },
+    ipHash: { type: String, default: "" },
   },
   { _id: false },
 );
@@ -50,18 +52,20 @@ const BriefSchema = new Schema(
     prompt: { type: String, required: true, maxlength: 4000 },
     category: { type: String, required: true, enum: [...CATEGORY_IDS] },
     confidence: { type: Number },
-    // Slot yang dirancang composer untuk brief ini (kategori + slot fakta
-    // yang relevan). Menggantikan `extra` lama; untuk brief yang dibuat
-    // sebelum migration, `slots` kosong dan slotDefsOf() fallback ke katalog.
     slots: { type: [SlotDefSchema], default: [] },
     answers: { type: Schema.Types.Mixed, default: {} },
     questionKeys: { type: [String], default: [] },
+    // "inspiration" = hanya design tokens; "remake" = teks + gambar + multi-page.
+    // null = belum dipilih (wizard akan menampilkan langkah Referensi).
+    refMode: {
+      type: String,
+      enum: ["inspiration", "remake", null],
+      default: null,
+    },
+    // Consent hanya relevan untuk mode remake.
+    refConsent: { type: RefConsentSchema, default: null },
     status: {
       type: String,
-      // "classifying" = classifier masih jalan (retry loop di background)
-      // "open"        = classifier sukses, wizard siap
-      // "failed"      = 3 attempt gagal, brief tidak bisa dilanjutkan
-      // "used"        = user sudah tekan Generate, brief dikonsumsi project
       enum: ["classifying", "open", "failed", "used"],
       default: "open",
     },
