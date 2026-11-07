@@ -1,7 +1,7 @@
 // src/routes/paymentRoutes.ts
 import express, { Router } from "express";
-import type { RequestHandler } from "express";
-import { isPaymentsEnabled } from "../config/env.js";
+import type { Request, RequestHandler } from "express";
+import { canUseMidtrans, getMidtransConfig } from "../config/env.js";
 import { createPaymentController } from "../controllers/paymentController.js";
 import {
   createManual,
@@ -10,15 +10,52 @@ import {
 } from "../controllers/manualPaymentController.js";
 import { authMiddleware } from "../middleware/authMiddleware.js";
 import { fail } from "../utils/apiError.js";
+import { verifySession } from "../utils/jwt.js";
 import { signupConfig } from "../services/abuseGuard.js";
 import { creditCosts } from "../services/credits.js";
 import { createMidtransGateway } from "../services/payments/midtransGateway.js";
 import type { PaymentGateway } from "../services/payments/midtransGateway.js";
 import { CREDIT_PACKAGES } from "../utils/packages.js";
 
-const requirePaymentsEnabled: RequestHandler = (_req, res, next) => {
-  if (!isPaymentsEnabled()) {
+// Email dari session cookie yang sudah di-sign (payload JWT: { userId, email }).
+// Buat endpoint publik yang jawabannya beda per akun. null = tamu / token rusak.
+const sessionEmail = (req: Request): string | null => {
+  const token: unknown = req.cookies?.token;
+  if (typeof token !== "string" || !token) return null;
+  try {
+    const session: unknown = verifySession(token);
+    if (
+      typeof session === "object" &&
+      session !== null &&
+      "email" in session &&
+      typeof session.email === "string"
+    ) {
+      return session.email;
+    }
+  } catch {
+    // token kadaluarsa / rusak: perlakukan sebagai tamu
+  }
+  return null;
+};
+
+// Pengganti requirePaymentsEnabled. Harus jalan SETELAH authMiddleware (butuh req.user).
+// PAYMENTS_ENABLED=true -> semua user. false -> cuma email di MIDTRANS_TEST_EMAILS.
+const requireMidtransAccess: RequestHandler = (req, res, next) => {
+  const email = (req as Request & { user?: { email?: unknown } }).user?.email;
+  if (!canUseMidtrans(typeof email === "string" ? email : null)) {
     fail(res, 503, "PAYMENTS_DISABLED", {}, "Midtrans payments are disabled");
+    return;
+  }
+  try {
+    getMidtransConfig(); // kunci Midtrans harus lengkap
+  } catch {
+    fail(
+      res,
+      503,
+      "PAYMENTS_DISABLED",
+      {},
+      "Midtrans payments are not configured",
+    );
     return;
   }
   next();
@@ -37,8 +74,11 @@ const requireManualEnabled: RequestHandler = (_req, res, next) => {
   next();
 };
 
-const getPublicPackages: RequestHandler = (_req, res) => {
-  res.set("Cache-Control", "public, max-age=60");
+const getPublicPackages: RequestHandler = (req, res) => {
+  const email = sessionEmail(req);
+  // Jawabannya tergantung siapa yang nanya: cache bersama ga boleh nyampur antar user
+  res.set("Vary", "Cookie");
+  res.set("Cache-Control", email ? "private, no-store" : "public, max-age=60");
   res.json({
     packages: CREDIT_PACKAGES.map((p) => ({
       id: p.id,
@@ -49,7 +89,7 @@ const getPublicPackages: RequestHandler = (_req, res) => {
     costs: creditCosts(),
     freeCredits: signupConfig().credits,
     methods: {
-      midtrans: isPaymentsEnabled(),
+      midtrans: canUseMidtrans(email),
       manual: isManualEnabled(),
     },
   });
@@ -67,14 +107,14 @@ export function createPaymentRouter(
 
   router.get(
     "/config",
-    requirePaymentsEnabled,
     authMiddleware,
+    requireMidtransAccess,
     controller.getConfig,
   );
   router.post(
     "/checkout",
-    requirePaymentsEnabled,
     authMiddleware,
+    requireMidtransAccess,
     controller.checkout,
   );
 

@@ -120,6 +120,24 @@ export function isPaymentsEnabled() {
   );
 }
 
+// Akun yang boleh pakai Midtrans Snap walau PAYMENTS_ENABLED=false (akun test reviewer).
+// Email dipisah koma, dibandingin lowercase.
+export function getMidtransTestEmails() {
+  return String(process.env.MIDTRANS_TEST_EMAILS ?? "")
+    .split(",")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+/** @param {string | null | undefined} email */
+export function canUseMidtrans(email) {
+  if (isPaymentsEnabled()) return true;
+  const mail = String(email ?? "")
+    .trim()
+    .toLowerCase();
+  return mail !== "" && getMidtransTestEmails().includes(mail);
+}
+
 // Optional. Only used to build the Snap `callbacks.finish` URL, nothing sensitive.
 export function getPublicAppUrl() {
   const raw = String(process.env.PUBLIC_APP_URL ?? "")
