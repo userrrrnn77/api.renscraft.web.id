@@ -14,10 +14,8 @@
     "payments:reconcile": "node --import tsx scripts/reconcile-payments.mjs",
     "worker:ocr": "node --import tsx worker/ocr.js",
     "deploy": "bash deploy.sh",
-    "sync-deps": "cp -r node_modules /home/rendy/renscraft-server/",
-    "sync-env": "cp .env /home/rendy/renscraft-server/.env",
-    "restart-prod": "pm2 restart renscraft-api renscraft-ocr",
-    "sync-all": "pm2 stop renscraft-api && pm2 stop renscraft-ocr && bun run sync-deps && bun run sync-env && bash deploy.sh && bun run restart-prod"
+    "sync-env": "scp .env renscraft:~/renscraft-server/.env",
+    "sync-all": "git add . && git commit -m 'auto deploy' || true && git push && bun run sync-env && ssh renscraft '~/deploy-renscraft.sh'"
   },
   "keywords": [],
   "author": "rensdev",
