@@ -285,5 +285,6 @@ export const uploadProof = asyncHandler(async (req: Request, res: Response) => {
   res.status(200).json({
     orderId: result.order.orderId,
     status: result.order.status,
+    proofUrl: proofUrl, 
   });
 });
