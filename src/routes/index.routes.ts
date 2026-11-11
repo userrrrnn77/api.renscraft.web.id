@@ -8,6 +8,7 @@ import adminRouter from "./adminRoutes.js";
 import redeemRouter from "./redeemRoutes.js";
 import referralRouter from "./referralRoutes.js";
 import dynamicRouter from "./dynamicRoutes.js";
+import adsRoutes from "./adsRoutes.js"; // bikin file adsRoutes.js dulu
 
 const appRouter = Router();
 
@@ -20,5 +21,6 @@ appRouter.use("/admin", adminRouter);
 appRouter.use("/redeem", redeemRouter);
 appRouter.use("/referral", referralRouter);
 appRouter.use("/dynamic", dynamicRouter);
+appRouter.use("/ads", adsRoutes);
 
 export default appRouter;
